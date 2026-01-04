@@ -1,0 +1,32 @@
+[package]
+name = "suntimes-rs"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0"
+authors = ["Sami Farin"]
+rust-version = "1.88"
+
+[dependencies]
+# NREL SPA implementation for high precision
+solar-positioning = "0.4"
+clap = { version = "4.5", features = ["derive", "env"] }
+chrono = "0.4"
+chrono-tz = "0.10"
+tzf-rs = "1.1"
+humantime = "2.3"
+iana-time-zone = "0.1"
+chrono-english = "0.1"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+
+[profile.release]
+opt-level = 3
+debug = true
+strip = false
+lto = true
+panic = "abort"
+
+[build-dependencies]
+cargo-lock = "11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
