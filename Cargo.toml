@@ -15,9 +15,10 @@ chrono-tz = "0.10"
 tzf-rs = "1.1"
 humantime = "2.3"
 iana-time-zone = "0.1"
-chrono-english = "0.1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
+parse_datetime = "0.13"
+jiff = { version = "0.2.18", features = ["serde"] }
 
 [profile.release]
 opt-level = 3

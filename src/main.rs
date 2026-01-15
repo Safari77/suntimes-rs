@@ -1,7 +1,7 @@
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
-use chrono_english::{Dialect, parse_date_string};
 use chrono_tz::Tz;
 use clap::Parser;
+use parse_datetime::parse_datetime_at_date;
 use solar_positioning::{
     time::DeltaT,
     types::{RefractionCorrection, SunriseResult},
@@ -20,6 +20,35 @@ use cli::{Args, DepInfo};
 use geo::{SOLAR_RADIUS_DEG, horizon_dip_deg};
 use solar::{SolarCalc, day_length};
 use time::{parse_time_ns, resolve_timezone, system_timezone};
+
+fn parse_relative_to_chrono<Tz>(anchor: &DateTime<Tz>, input: &str) -> Result<DateTime<Tz>, String>
+where
+    Tz: TimeZone + std::fmt::Display,
+    Tz::Offset: std::fmt::Display,
+{
+    // 1. Convert Chrono Anchor -> Jiff Anchor
+    let tz_name = anchor.timezone().to_string();
+
+    let jiff_tz = jiff::tz::TimeZone::get(&tz_name)
+        .map_err(|e| format!("Jiff failed to load tz '{}': {}", tz_name, e))?;
+
+    let jiff_anchor =
+        jiff::Timestamp::new(anchor.timestamp(), anchor.timestamp_subsec_nanos() as i32)
+            .map_err(|e| format!("Timestamp conversion failed: {}", e))?
+            .to_zoned(jiff_tz);
+
+    let parsed_jiff = parse_datetime_at_date(jiff_anchor, input)
+        .map_err(|e| format!("Failed to parse '{}': {}", input, e))?;
+
+    // Convert Jiff Result -> Chrono
+    let ts = parsed_jiff.timestamp();
+    let dt_utc = Utc
+        .timestamp_opt(ts.as_second(), ts.subsec_nanosecond() as u32)
+        .single()
+        .ok_or("Resulting timestamp is invalid in Chrono")?;
+
+    Ok(dt_utc.with_timezone(&anchor.timezone()))
+}
 
 // ===================== MAIN =====================
 
@@ -62,9 +91,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Anchor 'today' to the target timezone
     let anchor_time = Utc::now().with_timezone(&tz);
-    let date = match &args.date {
-        Some(s) => parse_date_string(s, anchor_time, Dialect::Us)?.with_timezone(&tz),
-        None => anchor_time,
+    let date = if let Some(s) = &args.date {
+        parse_relative_to_chrono(&anchor_time, s)?
+    } else {
+        anchor_time
     };
 
     let base_alt = if args.civil {
@@ -782,4 +812,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    #[test]
+    fn test_conversion_preserves_timezone() {
+        // 1. Setup: Create a time in New York (UTC-5)
+        // 2023-01-01 12:00:00 UTC is 07:00:00 in New York
+        let ny_tz: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let anchor = Utc.timestamp_opt(1672574400, 0).unwrap().with_timezone(&ny_tz);
+        assert_eq!(anchor.to_string(), "2023-01-01 07:00:00 EST");
+        let result = parse_relative_to_chrono(&anchor, "tomorrow");
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        // The time shifted by 1 day
+        assert_eq!(val.to_string(), "2023-01-02 07:00:00 EST");
+        // The resulting Chrono object is still in New York time, not UTC
+        assert_eq!(val.timezone(), ny_tz);
+    }
+
+    #[test]
+    fn test_handles_utc_gracefully() {
+        let anchor = Utc::now();
+        let result = parse_relative_to_chrono(&anchor, "tomorrow");
+
+        assert!(result.is_ok());
+        let val = result.unwrap();
+        // Ensure it's still UTC
+        assert_eq!(val.timezone(), Utc);
+        // Ensure time moved forward
+        assert!(val > anchor);
+    }
+
+    #[test]
+    fn test_propagates_parsing_errors() {
+        let anchor = Utc::now();
+        let result = parse_relative_to_chrono(&anchor, "shallnotpass");
+
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap();
+        assert!(err_msg.contains("Failed to parse"));
+    }
 }
