@@ -17,7 +17,7 @@ humantime = "2.3"
 iana-time-zone = "0.1"
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
-parse_datetime = "0.13"
+parse_datetime = "0.14"
 jiff = { version = "0.2", features = ["serde"] }
 
 [profile.release]
