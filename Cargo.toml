@@ -4,7 +4,6 @@ version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0"
 authors = ["Sami Farin"]
-rust-version = "1.92"
 
 [dependencies]
 # NREL SPA implementation for high precision
