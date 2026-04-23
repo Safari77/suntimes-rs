@@ -192,7 +192,10 @@ pub fn print_sun_events(
                 transit.format("%H:%M:%S")
             );
 
-            if let Some((kind, t)) = calc.find_next_event(date) {
+            // `find_next_event` now returns Result. The "next event" line is
+            // informational; a real SPA error would already have surfaced in the
+            // main computation above, so we silently ignore it here.
+            if let Ok(Some((kind, t))) = calc.find_next_event(date) {
                 println!("Next {} on {} at {}", kind, t.date_naive(), t.format("%H:%M:%S %Z"));
             }
         }
@@ -355,14 +358,11 @@ pub fn print_yearly_optimization(
         // Explain that azimuth is fixed (real-world behavior)
         if !result.periods.is_empty() {
             let fixed_az = result.periods[0].azimuth_deg;
-            let direction = if fixed_az > 135.0 && fixed_az < 225.0 {
-                "south"
-            } else if !(45.0..=315.0).contains(&fixed_az) {
-                "north"
-            } else if (45.0..=135.0).contains(&fixed_az) {
-                "east"
-            } else {
-                "west"
+            let direction = match fixed_az {
+                a if (135.0..=225.0).contains(&a) => "south",
+                a if (45.0..=135.0).contains(&a) => "east",
+                a if (225.0..=315.0).contains(&a) => "west",
+                _ => "north",
             };
             println!("Panel orientation: {:.0}° azimuth (facing {})", fixed_az, direction);
             println!("Note: Only tilt is adjusted seasonally (standard practice)");

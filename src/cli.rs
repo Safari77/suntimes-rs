@@ -2,21 +2,58 @@
 //!
 //! Handles argument parsing and validation for the suntimes-rs application.
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Deserialize;
+
+// ===================== TYPES =====================
+
+/// Sun position model.
+///
+/// Clap renders each variant lowercased in `--help`, preserving the original
+/// string interface (`--model noaa | horizons | physical`).
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SunModel {
+    /// NOAA-style calculation (refraction + horizon dip for altitude)
+    Noaa,
+    /// Geometric horizon (refraction on, no altitude dip — matches JPL HORIZONS)
+    Horizons,
+    /// Physical model (altitude-adjusted pressure + temperature refraction)
+    Physical,
+}
+
+impl std::fmt::Display for SunModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Must match clap's lowercased variant names so `default_value_t`
+        // round-trips correctly through the ValueEnum parser.
+        let s = match self {
+            SunModel::Noaa => "noaa",
+            SunModel::Horizons => "horizons",
+            SunModel::Physical => "physical",
+        };
+        f.write_str(s)
+    }
+}
 
 // ===================== CLI =====================
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
 pub struct Args {
-    #[arg(required_unless_present = "show_build_info")]
-
     /// Observer latitude in decimal degrees (-90 to 90)
-    #[arg(long, allow_hyphen_values = true, value_parser = parse_latitude, env = "ARGOS_SUNTIMES_LATITUDE")]
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_parser = parse_latitude,
+        env = "ARGOS_SUNTIMES_LATITUDE",
+    )]
     pub latitude: f64,
     /// Observer longitude in decimal degrees (-180 to 180)
-    #[arg(long, allow_hyphen_values = true, value_parser = parse_longitude, env = "ARGOS_SUNTIMES_LONGITUDE")]
+    #[arg(
+        long,
+        allow_hyphen_values = true,
+        value_parser = parse_longitude,
+        env = "ARGOS_SUNTIMES_LONGITUDE",
+    )]
     pub longitude: f64,
     /// Time zone to use ("system", "location", or IANA time zone name)
     #[arg(long, default_value = "system", env = "ARGOS_SUNTIMES_TIMEZONE")]
@@ -27,8 +64,8 @@ pub struct Args {
     pub altitude: f64,
 
     /// Sun position model to use
-    #[arg(long, default_value = "noaa", value_parser = ["noaa", "horizons", "physical"], env = "ARGOS_SUNTIMES_MODEL")]
-    pub model: String,
+    #[arg(long, default_value_t = SunModel::Noaa, value_enum, env = "ARGOS_SUNTIMES_MODEL")]
+    pub model: SunModel,
     /// Ambient temperature in °C for refraction correction (physical model only)
     #[arg(long, default_value_t = 15.0, allow_hyphen_values = true)]
     pub temperature: f64,

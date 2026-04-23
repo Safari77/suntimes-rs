@@ -28,8 +28,13 @@ const OZONE_GRID: [[f64; 12]; 9] = [
 
 /// Estimate total ozone column in Dobson Units (DU)
 ///
-/// Uses a monthly gridded climatology for better regional accuracy.
-/// Now includes altitude correction and data-mismatch warnings.
+/// Uses a monthly gridded climatology for better regional accuracy,
+/// with a tropospheric altitude correction on top.
+///
+/// Note: This function is called from inner loops in yearly optimization, so
+/// it deliberately performs no I/O. Callers that want to surface the
+/// ozone-hole caveat should check [`is_ozone_hole_season`] once at the top
+/// level and print their own message.
 pub fn estimate_ozone_column(latitude: f64, month: u32, altitude_m: f64) -> f64 {
     // 1. Map latitude to grid row (-90..90 -> 0..8)
     let row_idx = ((latitude + 90.0) / 20.0).floor() as usize;
@@ -48,16 +53,15 @@ pub fn estimate_ozone_column(latitude: f64, month: u32, altitude_m: f64) -> f64 
     let elevation_correction = 1.0 - (0.035 * altitude_km);
     ozone_du *= elevation_correction;
 
-    // 5. Warning Logic: Specific Polar Shifts
-    // Warn users in the Southern Hemisphere during Ozone Hole season (Sept-Nov)
-    if latitude < -60.0 && (9..=11).contains(&month) {
-        eprintln!(
-            "Warning: Significant ozone depletion possible at lat {:.1} during month {}. Climatology may overestimate UVI.",
-            latitude, month
-        );
-    }
-
     ozone_du.clamp(150.0, 500.0)
+}
+
+/// True if the climatology-driven UV index at this latitude & month is likely
+/// to underestimate reality due to seasonal Antarctic ozone depletion.
+///
+/// Southern Hemisphere, poleward of 60°S, September through November.
+pub fn is_ozone_hole_season(latitude: f64, month: u32) -> bool {
+    latitude < -60.0 && (9..=11).contains(&month)
 }
 
 /// Calculate Angstrom Aerosol Optical Depth at specific wavelength
@@ -121,108 +125,100 @@ fn calculate_uv_transmission(solar_zenith_angle: f64, ozone_du: f64, airmass: f6
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(test)]
-    mod tests {
-        use super::*;
 
-        #[test]
-        fn test_ozone_estimation_seasonal_bounds() {
-            // NH Mid-latitudes: April (Month 4) should have higher ozone than October (Month 10)
-            let spring = estimate_ozone_column(45.0, 4, 0.0);
-            let fall = estimate_ozone_column(45.0, 10, 0.0);
-            assert!(spring > fall, "NH Spring ozone ({}) should be > Fall ({})", spring, fall);
+    #[test]
+    fn test_ozone_estimation_seasonal_bounds() {
+        // NH Mid-latitudes: April (Month 4) should have higher ozone than October (Month 10)
+        let spring = estimate_ozone_column(45.0, 4, 0.0);
+        let fall = estimate_ozone_column(45.0, 10, 0.0);
+        assert!(spring > fall, "NH Spring ozone ({}) should be > Fall ({})", spring, fall);
 
-            // Tropics should be consistently lower than mid-latitudes
-            let tropics = estimate_ozone_column(0.0, 1, 0.0);
-            assert!(tropics < 300.0);
-        }
+        // Tropics should be consistently lower than mid-latitudes
+        let tropics = estimate_ozone_column(0.0, 1, 0.0);
+        assert!(tropics < 300.0);
+    }
 
-        #[test]
-        fn test_uvi_benchmarks() {
-            // Benchmark 1: Tropical Noon (Zenith sun, high GHI, low airmass, low ozone)
-            // Result should be "Extreme" (11+)
-            let uvi_tropics = calculate_uv_index(90.0, 1050.0, 1.0, 0.0, 3, 0.0);
-            assert!(uvi_tropics > 11.0, "Tropical noon UVI should be extreme, got {}", uvi_tropics);
+    #[test]
+    fn test_uvi_benchmarks() {
+        // Benchmark 1: Tropical Noon (Zenith sun, high GHI, low airmass, low ozone)
+        // Result should be "Extreme" (11+)
+        let uvi_tropics = calculate_uv_index(90.0, 1050.0, 1.0, 0.0, 3, 0.0);
+        assert!(uvi_tropics > 11.0, "Tropical noon UVI should be extreme, got {}", uvi_tropics);
 
-            // Benchmark 2: Mid-latitude Summer Noon (45N, ~68 elev, June/Month 6)
-            // Result should be "Very High" (8-10)
-            let uvi_summer = calculate_uv_index(68.0, 950.0, 1.08, 45.0, 6, 0.0);
-            assert!(
-                uvi_summer > 7.0 && uvi_summer < 11.0,
-                "Summer UVI {} out of range",
-                uvi_summer
-            );
+        // Benchmark 2: Mid-latitude Summer Noon (45N, ~68 elev, June/Month 6)
+        // Result should be "Very High" (8-10)
+        let uvi_summer = calculate_uv_index(68.0, 950.0, 1.08, 45.0, 6, 0.0);
+        assert!(uvi_summer > 7.0 && uvi_summer < 11.0, "Summer UVI {} out of range", uvi_summer);
 
-            // Benchmark 3: Mid-latitude Winter Noon (45N, ~22 elev, Dec/Month 12)
-            // Result should be "Low" (< 2)
-            let uvi_winter = calculate_uv_index(22.0, 400.0, 2.6, 45.0, 12, 0.0);
-            assert!(uvi_winter < 2.0, "Winter UVI {} must be low (< 2.0)", uvi_winter);
-        }
+        // Benchmark 3: Mid-latitude Winter Noon (45N, ~22 elev, Dec/Month 12)
+        // Result should be "Low" (< 2)
+        let uvi_winter = calculate_uv_index(22.0, 400.0, 2.6, 45.0, 12, 0.0);
+        assert!(uvi_winter < 2.0, "Winter UVI {} must be low (< 2.0)", uvi_winter);
+    }
 
-        #[test]
-        fn test_stratospheric_uv_resilience() {
-            // Sea level: Month 6, altitude 0m
-            let uvi_sea = calculate_uv_index(60.0, 800.0, 1.15, 45.0, 6, 0.0);
-            // Stratosphere (11km): Less ozone above city
-            let uvi_11km = calculate_uv_index(60.0, 1000.0, 0.25, 45.0, 6, 11000.0);
+    #[test]
+    fn test_stratospheric_uv_resilience() {
+        // Sea level: Month 6, altitude 0m
+        let uvi_sea = calculate_uv_index(60.0, 800.0, 1.15, 45.0, 6, 0.0);
+        // Stratosphere (11km): Less ozone above city
+        let uvi_11km = calculate_uv_index(60.0, 1000.0, 0.25, 45.0, 6, 11000.0);
 
-            assert!(
-                uvi_11km > uvi_sea * 1.5,
-                "Stratospheric UVI ({}) should be much higher than sea level ({})",
-                uvi_11km,
-                uvi_sea
-            );
-        }
+        assert!(
+            uvi_11km > uvi_sea * 1.5,
+            "Stratospheric UVI ({}) should be much higher than sea level ({})",
+            uvi_11km,
+            uvi_sea
+        );
+    }
 
-        #[test]
-        fn test_polar_day_lapland() {
-            // Lapland (~67.4°N) June (Month 6)
-            let latitude = 67.4;
-            let month = 6;
-            let sun_elevation = 46.0;
-            let ghi = 750.0;
-            let airmass = 1.39;
+    #[test]
+    fn test_polar_day_lapland() {
+        // Lapland (~67.4°N) June (Month 6)
+        let latitude = 67.4;
+        let month = 6;
+        let sun_elevation = 46.0;
+        let ghi = 750.0;
+        let airmass = 1.39;
 
-            let uvi = calculate_uv_index(sun_elevation, ghi, airmass, latitude, month, 200.0);
+        let uvi = calculate_uv_index(sun_elevation, ghi, airmass, latitude, month, 200.0);
 
-            // Expected: Moderate (3-6)
-            assert!(uvi >= 3.0 && uvi <= 6.0, "Lapland summer UVI {} should be moderate", uvi);
-        }
+        // Expected: Moderate (3-6)
+        assert!(uvi >= 3.0 && uvi <= 6.0, "Lapland summer UVI {} should be moderate", uvi);
+    }
 
-        #[test]
-        fn test_extreme_uv_high_altitude_quito() {
-            // Quito (~0.2°S) at ~2850m elevation in March (Month 3)
-            let latitude = -0.2;
-            let month = 3;
-            let sun_elevation = 90.0;
-            let ghi = 1150.0;
-            let airmass = 0.72;
+    #[test]
+    fn test_extreme_uv_high_altitude_quito() {
+        // Quito (~0.2°S) at ~2850m elevation in March (Month 3)
+        let latitude = -0.2;
+        let month = 3;
+        let sun_elevation = 90.0;
+        let ghi = 1150.0;
+        let airmass = 0.72;
 
-            let uvi = calculate_uv_index(sun_elevation, ghi, airmass, latitude, month, 2850.0);
+        let uvi = calculate_uv_index(sun_elevation, ghi, airmass, latitude, month, 2850.0);
 
-            // Quito has extreme UV (>14) due to low ozone and altitude correction
-            assert!(uvi > 14.0, "Quito equinox UVI {} should be extreme (>14)", uvi);
-        }
+        // Quito has extreme UV (>14) due to low ozone and altitude correction
+        assert!(uvi > 14.0, "Quito equinox UVI {} should be extreme (>14)", uvi);
+    }
 
-        #[test]
-        fn test_australia_summer_perth() {
-            // Perth (~31.9°S) in January (Month 1)
-            let latitude = -31.9;
-            let month = 1;
-            let sun_elevation = 81.5;
-            let ghi = 1080.0;
-            let airmass = 1.01;
+    #[test]
+    fn test_australia_summer_perth() {
+        // Perth (~31.9°S) in January (Month 1)
+        let latitude = -31.9;
+        let month = 1;
+        let sun_elevation = 81.5;
+        let ghi = 1080.0;
+        let airmass = 1.01;
 
-            let uvi = calculate_uv_index(sun_elevation, ghi, airmass, latitude, month, 30.0);
+        let uvi = calculate_uv_index(sun_elevation, ghi, airmass, latitude, month, 30.0);
 
-            // Australian summer UVI is notoriously extreme (11+)
-            assert!(uvi >= 11.0, "Australian summer UVI {} should be extreme (>=11)", uvi);
-        }
+        // Australian summer UVI is notoriously extreme (11+)
+        assert!(uvi >= 11.0, "Australian summer UVI {} should be extreme (>=11)", uvi);
+    }
 
-        #[test]
-        fn test_zero_uvi_at_night() {
-            assert_eq!(calculate_uv_index(-5.0, 0.0, 0.0, 10.0, 6, 0.0), 0.0);
-            assert_eq!(calculate_uv_index(0.0, 10.0, 10.0, 40.0, 6, 0.0), 0.0);
-        }
+    #[test]
+    fn test_zero_uvi_at_night() {
+        assert_eq!(calculate_uv_index(-5.0, 0.0, 0.0, 10.0, 6, 0.0), 0.0);
+        assert_eq!(calculate_uv_index(0.0, 10.0, 10.0, 40.0, 6, 0.0), 0.0);
     }
 }

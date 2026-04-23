@@ -18,11 +18,25 @@ pub struct OptimizationConstraints {
     pub azimuth_min: f64,
     /// Maximum allowed azimuth (degrees)
     pub azimuth_max: f64,
+    /// True if the user explicitly set an azimuth range.
+    ///
+    /// Gates the azimuth search strategy: a default full 0..360 circle uses a
+    /// cardinal-quadrant scan to handle 0°/360° wraparound, while a user-set
+    /// (possibly narrow) range uses direct golden-section search inside it.
+    ///
+    /// Tilt has no wraparound, so no corresponding flag is needed.
+    azimuth_explicit: bool,
 }
 
 impl Default for OptimizationConstraints {
     fn default() -> Self {
-        Self { tilt_min: 0.0, tilt_max: 90.0, azimuth_min: 0.0, azimuth_max: 360.0 }
+        Self {
+            tilt_min: 0.0,
+            tilt_max: 90.0,
+            azimuth_min: 0.0,
+            azimuth_max: 360.0,
+            azimuth_explicit: false,
+        }
     }
 }
 
@@ -39,8 +53,15 @@ impl OptimizationConstraints {
         if let Some((min, max)) = range {
             self.azimuth_min = min.clamp(0.0, 360.0);
             self.azimuth_max = max.clamp(0.0, 360.0);
+            self.azimuth_explicit = true;
         }
         self
+    }
+
+    /// True if the user left the azimuth range at the default full 0..360 circle.
+    /// Callers use this to pick the azimuth search algorithm.
+    pub fn azimuth_unconstrained(&self) -> bool {
+        !self.azimuth_explicit
     }
 }
 
@@ -111,11 +132,9 @@ pub fn optimize_fixed_panel_constrained(
 ) -> PanelOptimum {
     let mut evaluations = 0;
 
-    // Check if we're using default (unconstrained) settings
-    let is_unconstrained = (constraints.tilt_min - 0.0).abs() < 0.1
-        && (constraints.tilt_max - 90.0).abs() < 0.1
-        && (constraints.azimuth_min - 0.0).abs() < 0.1
-        && (constraints.azimuth_max - 360.0).abs() < 0.1;
+    // `is_unconstrained` here gates the azimuth search strategy only — tilt has
+    // no wraparound, so it's always GSS on the (possibly constrained) range.
+    let is_unconstrained = constraints.azimuth_unconstrained();
 
     // Helper closure to calculate energy and count evaluations
     // We capture specific variables to avoid cloning the whole context repeatedly
@@ -677,6 +696,7 @@ fn optimize_period_hsat(
 
 /// Calculate period boundaries for the year
 fn calculate_period_boundaries(days_in_year: u32, num_periods: u32) -> Vec<(u32, u32)> {
+    assert!(num_periods >= 1);
     let mut periods = Vec::with_capacity(num_periods as usize);
     let period_length = days_in_year as f64 / num_periods as f64;
 
@@ -719,7 +739,7 @@ fn select_sample_days(start_day: u32, end_day: u32) -> Vec<u32> {
             days.push(current);
             current += 7;
         }
-        if *days.last().unwrap() != end_day {
+        if days.last() != Some(&end_day) {
             days.push(end_day);
         }
         days
@@ -800,7 +820,7 @@ fn generate_sun_positions(
     let end = noon + Duration::hours(12);
 
     while t <= end {
-        let pos = solar.position(t);
+        let pos = solar.position(t).expect("SPA failed in test helper");
 
         let hour_of_day = t.time().num_seconds_from_midnight() as f64 / 3600.0;
 

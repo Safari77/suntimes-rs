@@ -53,13 +53,7 @@ where
 // ===================== MAIN =====================
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-    // Manual override logic:
-    // If --no-argos is present, it forces Argos mode off,
-    // ignoring ENABLE_ARGOS env var or --argos flag.
-    let use_argos = args.argos && !args.no_argos;
-
-    if args.show_build_info {
+    if std::env::args().any(|arg| arg == "--show-build-info") {
         println!("Built from Git commit: {}\n", env!("APP_GIT_HASH"));
         const DEP_INFO_RAW: &str = include_str!(env!("DEPS_INFO_PATH"));
         let deps: Vec<DepInfo> = serde_json::from_str(DEP_INFO_RAW).unwrap();
@@ -76,6 +70,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+
+    let args = Args::parse();
+    // Manual override logic:
+    // If --no-argos is present, it forces Argos mode off,
+    // ignoring ENABLE_ARGOS env var or --argos flag.
+    let use_argos = args.argos && !args.no_argos;
 
     let tz = if args.utc {
         Tz::UTC
@@ -107,34 +107,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         -SOLAR_RADIUS_DEG
     };
 
-    // Helper to find the "Logical Midnight" (Start of Day) safely
-    // Returns the first valid time on that day (00:00, or 01:00 if gap, etc.)
-    let find_start_of_day = |d: chrono::NaiveDate| -> DateTime<Tz> {
-        // Try 00:00:00
-        match tz.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()) {
-            chrono::LocalResult::Single(t) => t,
-            chrono::LocalResult::Ambiguous(t, _) => t, // Fall back: first occurrence
-            chrono::LocalResult::None => {
-                // 00:00 doesn't exist (DST Gap). Try 01:00:00
-                match tz.from_local_datetime(&d.and_hms_opt(1, 0, 0).unwrap()) {
-                    chrono::LocalResult::Single(t) => t,
-                    chrono::LocalResult::Ambiguous(t, _) => t,
-                    chrono::LocalResult::None => {
-                        // Extremely rare edge case (missing 00:00 AND 01:00).
-                        // Fallback to the 'date' provided by CLI, stripped of time if possible
-                        date
-                    }
-                }
-            }
-        }
-    };
+    // Helper to find the "Logical Midnight" (Start of Day) safely.
+    // Returns the first valid time on that day (00:00, or 01:00 if a DST gap
+    // skipped midnight, or `date` if neither exists).
+    let find_start_of_day =
+        |d: chrono::NaiveDate| -> DateTime<Tz> { time::start_of_day(tz, d, date) };
 
     let delta_t: f64 = DeltaT::estimate_from_date(date.year(), date.month())?;
 
     // Twilight is geometric; disable refraction if twilight flag is set
     let is_twilight_mode = args.civil || args.nautical || args.astro;
-    let calc = match args.model.as_str() {
-        "noaa" => {
+    let calc = match args.model {
+        cli::SunModel::Noaa => {
             let dip =
                 if is_twilight_mode { 0.0 } else { horizon_dip_deg(args.latitude, args.altitude) };
             // If twilight mode, force refr to None
@@ -149,7 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target: base_alt - dip,
             }
         }
-        "horizons" => {
+        cli::SunModel::Horizons => {
             let refr = if is_twilight_mode { None } else { Some(RefractionCorrection::standard()) };
             SolarCalc {
                 lat: args.latitude,
@@ -160,7 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target: base_alt,
             }
         }
-        "physical" => {
+        cli::SunModel::Physical => {
             let dip =
                 if is_twilight_mode { 0.0 } else { horizon_dip_deg(args.latitude, args.altitude) };
 
@@ -185,19 +169,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 target: base_alt - dip,
             }
         }
-        _ => unreachable!(),
     };
 
     let transit_res = calc.get_transit(date).ok_or("Failed to compute solar transit")?;
     let transit = calc.extract_transit_time(&transit_res);
 
     // Get current sun position (only used for Argos or --at "now", but cheap to compute)
-    let now_pos = calc.position(now_dt);
+    let now_pos = calc.position(now_dt)?;
 
     // Get sun position at solar noon (max altitude)
-    let transit_pos = calc.position(transit);
+    let transit_pos = calc.position(transit)?;
 
-    let (sr, ss) = calc.solve_from_noon(transit);
+    let (sr, ss) = calc.solve_from_noon(transit)?;
 
     // Calculate tomorrow's day length
     let len_today = day_length(&sr, &ss);
@@ -207,21 +190,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Look ahead up to 2 days to handle day skips
     for _ in 0..2 {
         if let Some(d) = check_date {
-            // Try to find the start of this specific calendar day
-            let tomorrow_dt = match tz.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()) {
-                chrono::LocalResult::Single(t) => Some(t),
-                chrono::LocalResult::Ambiguous(t, _) => Some(t),
-                chrono::LocalResult::None => {
-                    // If 00:00 doesn't exist, try 01:00 (for DST)
-                    tz.from_local_datetime(&d.and_hms_opt(1, 0, 0).unwrap()).single()
-                }
-            };
+            // Find the first valid local instant on this calendar day.
+            // `start_of_day_opt` also correctly handles DST fall-back (`01:00` ambiguous),
+            // whereas the previous inline code used `.single()` which discarded that case.
+            let tomorrow_dt = time::start_of_day_opt(tz, d);
 
             if let Some(t_dt) = tomorrow_dt
                 && let Some(transit2_res) = calc.get_transit(t_dt)
             {
                 let transit2 = calc.extract_transit_time(&transit2_res);
-                let (sr2, ss2) = calc.solve_from_noon(transit2);
+                let (sr2, ss2) = calc.solve_from_noon(transit2)?;
                 len_tomorrow = day_length(&sr2, &ss2);
                 break; // Found a valid day!
             }
@@ -282,12 +260,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 chrono::LocalResult::None => {
                     // Handle Spring Forward (e.g. 02:30 doesn't exist).
-                    eprintln!(
-                        "Error: The time {} does not exist on {} (DST gap/Spring Forward).",
+                    // Return the error through the normal `?` path so any
+                    // cleanup / destructors in main's scope get to run, rather
+                    // than aborting the process abruptly.
+                    return Err(format!(
+                        "The time {} does not exist on {} (DST gap/Spring Forward).",
                         at,
                         date.date_naive()
-                    );
-                    std::process::exit(1);
+                    )
+                    .into());
                 }
             }
         }
@@ -297,7 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Determine which position to use for the "Current Conditions" solar panel output
     let (panel_output_pos, panel_output_label) = if let Some(dt) = target_dt {
-        (calc.position(dt), format!("at {}", dt.format("%H:%M:%S")))
+        (calc.position(dt)?, format!("at {}", dt.format("%H:%M:%S")))
     } else if args.date.is_some() {
         // If user set a date but no time, default to Solar Noon for that day
         (transit_pos, format!("at solar noon ({})", transit.format("%H:%M:%S")))
@@ -332,6 +313,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let month = date.month();
+
+    // Fire the Antarctic ozone-hole caveat exactly once (if applicable),
+    // rather than inside uv::calculate_uv_index which runs in hot loops.
+    if uv::is_ozone_hole_season(args.latitude, month) {
+        eprintln!(
+            "Warning: Significant ozone depletion possible at lat {:.1} during month {}. \
+             Climatology may overestimate UVI.",
+            args.latitude, month
+        );
+    }
+
     let uv_current = uv::calculate_uv_index(
         panel_output_pos.elevation_angle(),
         current_conditions.irradiance.ghi,
@@ -388,7 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Loop until strictly before end_dt
             while current_time < end_dt {
-                let pos = calc.position(current_time);
+                let pos = calc.position(current_time)?;
 
                 // Calculate hours from midnight reference
                 let duration_from_midnight = current_time.signed_duration_since(midnight_ref);
@@ -403,7 +395,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Always add the exact end point (Sunset or 24:00)
-            let pos_end = calc.position(end_dt);
+            let pos_end = calc.position(end_dt)?;
             let duration_end = end_dt.signed_duration_since(midnight_ref);
             let hours_end = duration_end.num_seconds() as f64 / 3600.0;
             let hours_end_norm = if hours_end < 0.0 { hours_end + 24.0 } else { hours_end };
@@ -490,22 +482,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let sun_pos_generator: optimize::SunPositionGenerator =
             Box::new(move |_lat, _lon, _alt, day_of_year| {
-                // Helper function to find start of day (inlined to avoid lifetime issues)
-                let find_start_of_day = |d: chrono::NaiveDate,
-                                         fallback_dt: DateTime<Tz>|
-                 -> DateTime<Tz> {
-                    match tz_clone.from_local_datetime(&d.and_hms_opt(0, 0, 0).unwrap()) {
-                        chrono::LocalResult::Single(t) => t,
-                        chrono::LocalResult::Ambiguous(t, _) => t,
-                        chrono::LocalResult::None => {
-                            match tz_clone.from_local_datetime(&d.and_hms_opt(1, 0, 0).unwrap()) {
-                                chrono::LocalResult::Single(t) => t,
-                                chrono::LocalResult::Ambiguous(t, _) => t,
-                                chrono::LocalResult::None => fallback_dt,
-                            }
-                        }
-                    }
-                };
+                let find_start_of_day =
+                    |d: chrono::NaiveDate, fallback_dt: DateTime<Tz>| -> DateTime<Tz> {
+                        time::start_of_day(tz_clone, d, fallback_dt)
+                    };
 
                 // Convert day_of_year to a date
                 let target_date = chrono::NaiveDate::from_yo_opt(year, day_of_year)
@@ -540,7 +520,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 let transit = calc_clone.extract_transit_time(&transit_res.unwrap());
-                let (sr, ss) = calc_clone.solve_from_noon(transit);
+                let (sr, ss) = match calc_clone.solve_from_noon(transit) {
+                    Ok(pair) => pair,
+                    Err(_) => return Vec::new(),
+                };
 
                 // Determine start and end times
                 let (start_dt, end_dt) = match (&sr, &ss) {
@@ -564,7 +547,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut current_time = start_dt;
 
                 while current_time < end_dt {
-                    let pos = calc_clone.position(current_time);
+                    // On SPA failure we abort this day and return what we have so
+                    // far; yearly optimization sums over sampled days, so a single
+                    // truncated/empty day only locally reduces accuracy.
+                    let pos = match calc_clone.position(current_time) {
+                        Ok(p) => p,
+                        Err(_) => return positions,
+                    };
                     let duration_from_midnight = current_time.signed_duration_since(midnight_ref);
                     let hours_relative = duration_from_midnight.num_seconds() as f64 / 3600.0;
                     let hours_normalized =
@@ -574,7 +563,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // Add endpoint
-                let pos_end = calc_clone.position(end_dt);
+                let pos_end = match calc_clone.position(end_dt) {
+                    Ok(p) => p,
+                    Err(_) => return positions,
+                };
                 let duration_end = end_dt.signed_duration_since(midnight_ref);
                 let hours_end = duration_end.num_seconds() as f64 / 3600.0;
                 let hours_end_norm = if hours_end < 0.0 { hours_end + 24.0 } else { hours_end };
@@ -639,7 +631,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     if let Some(dt) = target_dt {
-        let pos = calc.position(dt);
+        let pos = calc.position(dt)?;
         output::print_sun_position_at_time(dt, &pos, uv_current, uv_max);
 
         if let Some(ref config) = panel_config {

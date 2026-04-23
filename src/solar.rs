@@ -6,7 +6,9 @@
 use chrono::{DateTime, Duration, TimeZone};
 use chrono_tz::Tz;
 use solar_positioning::{
-    Horizon, spa,
+    Horizon,
+    error::Error as SpaError,
+    spa,
     types::{RefractionCorrection, SunriseResult},
 };
 
@@ -42,19 +44,24 @@ pub struct SolarCalc {
 }
 
 impl SolarCalc {
-    /// Calculate elevation error at a given time.
+    /// Compute the solar position and the elevation residual (`elevation - target`)
+    /// in a single SPA evaluation.
     ///
-    /// Returns the difference between current sun elevation and target.
-    pub fn elevation_error(&self, t: DateTime<Tz>) -> f64 {
-        spa::solar_position(t, self.lat, self.lon, self.alt, self.delta_t, self.refr)
-            .unwrap()
-            .elevation_angle()
-            - self.target
+    /// This is the fundamental cached primitive used by the bisection search —
+    /// we call into SPA exactly once per time point and reuse the result for both
+    /// the residual test and (at convergence) the azimuth readout.
+    fn position_and_error(
+        &self,
+        t: DateTime<Tz>,
+    ) -> Result<(solar_positioning::SolarPosition, f64), SpaError> {
+        let pos = spa::solar_position(t, self.lat, self.lon, self.alt, self.delta_t, self.refr)?;
+        let err = pos.elevation_angle() - self.target;
+        Ok((pos, err))
     }
 
     /// Get the solar position at a given time.
-    pub fn position(&self, t: DateTime<Tz>) -> solar_positioning::SolarPosition {
-        spa::solar_position(t, self.lat, self.lon, self.alt, self.delta_t, self.refr).unwrap()
+    pub fn position(&self, t: DateTime<Tz>) -> Result<solar_positioning::SolarPosition, SpaError> {
+        spa::solar_position(t, self.lat, self.lon, self.alt, self.delta_t, self.refr)
     }
 
     /// Solve for the time when sun crosses target elevation using bisection.
@@ -64,43 +71,53 @@ impl SolarCalc {
     /// * `b` - End of search interval
     ///
     /// # Returns
-    /// The crossing time and azimuth, or None if no crossing exists
-    pub fn solve_root(&self, mut a: DateTime<Tz>, mut b: DateTime<Tz>) -> Option<SunEvent> {
-        let mut fa = self.elevation_error(a);
-        let fb = self.elevation_error(b);
+    /// The crossing time and azimuth, or `Ok(None)` if no crossing exists in
+    /// the interval. Returns `Err` only on underlying SPA failure (invalid
+    /// inputs or out-of-range date).
+    pub fn solve_root(
+        &self,
+        mut a: DateTime<Tz>,
+        mut b: DateTime<Tz>,
+    ) -> Result<Option<SunEvent>, SpaError> {
+        // Cache both endpoints: we need `pa`'s azimuth at the final fallback,
+        // and `fb` for the initial sign-change check.
+        let (mut pa, mut fa) = self.position_and_error(a)?;
+        let (_pb, fb) = self.position_and_error(b)?;
 
         // Guard against NaN from invalid inputs
         if !fa.is_finite() || !fb.is_finite() {
-            return None;
+            return Ok(None);
         }
 
         if fa.signum() == fb.signum() {
-            return None;
+            return Ok(None);
         }
 
         for _ in 0..60 {
             let m = a + (b - a) / 2;
-            let fm = self.elevation_error(m);
+            // One SPA call per midpoint — no extra call at convergence.
+            let (pm, fm) = self.position_and_error(m)?;
 
             if !fm.is_finite() {
-                return None;
+                return Ok(None);
             }
 
             if fm.abs() < 1e-7 {
-                let az = self.position(m).azimuth();
-                return Some((m, az));
+                return Ok(Some((m, pm.azimuth())));
             }
 
             if fm.signum() == fa.signum() {
                 a = m;
+                pa = pm; // carry the cached position forward
                 fa = fm;
             } else {
                 b = m;
             }
         }
 
-        let az = self.position(a).azimuth();
-        Some((a, az))
+        // Bisection did not converge within 60 iterations — return current best
+        // using the cached position at `a`. No extra SPA call.
+        Ok(Some((a, pa.azimuth())))
     }
 
     /// Solve for sunrise and sunset from solar noon.
@@ -110,9 +127,11 @@ impl SolarCalc {
     ///
     /// # Returns
     /// Tuple of (sunrise, sunset) events
-    pub fn solve_from_noon(&self, noon: DateTime<Tz>) -> SunEvents {
+    pub fn solve_from_noon(&self, noon: DateTime<Tz>) -> Result<SunEvents, SpaError> {
         let span = Duration::hours(12);
-        (self.solve_root(noon - span, noon), self.solve_root(noon, noon + span))
+        let sr = self.solve_root(noon - span, noon)?;
+        let ss = self.solve_root(noon, noon + span)?;
+        Ok((sr, ss))
     }
 
     /// Get the solar transit result for a given date.
@@ -150,20 +169,24 @@ impl SolarCalc {
     /// * `start` - Time to start searching from
     ///
     /// # Returns
-    /// Tuple of (event_name, event_time), or None if not found
-    pub fn find_next_event(&self, start: DateTime<Tz>) -> Option<(String, DateTime<Tz>)> {
+    /// `Ok(Some((event_name, event_time)))` if found, `Ok(None)` if no event
+    /// within 370 days, `Err` on SPA failure.
+    pub fn find_next_event(
+        &self,
+        start: DateTime<Tz>,
+    ) -> Result<Option<(String, DateTime<Tz>)>, SpaError> {
         let tz = start.timezone();
         let mut current_naive = start.date_naive();
 
         for _ in 0..370 {
             // Safe Anchor: Find a valid time on this calendar day.
             // We prefer 12:00:00 as it is the most stable reference for solar events.
-            let d = match tz.from_local_datetime(&current_naive.and_hms_opt(12, 0, 0)?) {
+            let d = match tz.from_local_datetime(&current_naive.and_hms_opt(12, 0, 0).unwrap()) {
                 chrono::LocalResult::Single(t) => t,
                 chrono::LocalResult::Ambiguous(t, _) => t,
                 chrono::LocalResult::None => {
                     // If 12:00 doesn't exist (very rare), try start of day logic
-                    tz.from_local_datetime(&current_naive.and_hms_opt(0, 0, 0)?)
+                    tz.from_local_datetime(&current_naive.and_hms_opt(0, 0, 0).unwrap())
                         .earliest()
                         .unwrap_or(start)
                 }
@@ -171,7 +194,7 @@ impl SolarCalc {
 
             if let Some(transit_res) = self.get_transit(d) {
                 let transit = self.extract_transit_time(&transit_res);
-                let (sr, ss) = self.solve_from_noon(transit);
+                let (sr, ss) = self.solve_from_noon(transit)?;
 
                 let mut events = Vec::new();
                 if let Some((t, _)) = sr
@@ -186,14 +209,17 @@ impl SolarCalc {
                 }
 
                 if let Some((kind, t)) = events.into_iter().min_by_key(|(_, t)| *t) {
-                    return Some((kind.into(), t));
+                    return Ok(Some((kind.into(), t)));
                 }
             }
 
             // Move to the next calendar day safely
-            current_naive = current_naive.succ_opt()?;
+            let Some(next) = current_naive.succ_opt() else {
+                return Ok(None);
+            };
+            current_naive = next;
         }
-        None
+        Ok(None)
     }
 }
 
@@ -247,7 +273,7 @@ mod tests {
 
         let noon0_res = calc0.get_transit(date).unwrap();
         let noon0 = calc0.extract_transit_time(&noon0_res);
-        let (sr0, _) = calc0.solve_from_noon(noon0);
+        let (sr0, _) = calc0.solve_from_noon(noon0).unwrap();
         let sr0 = sr0.unwrap().0;
 
         // --- Dead Sea ---
@@ -260,7 +286,7 @@ mod tests {
             target: base_alt - horizon_dip_deg(lat, -450.0),
         };
 
-        let (sr_ds, _) = calc_ds.solve_from_noon(noon0);
+        let (sr_ds, _) = calc_ds.solve_from_noon(noon0).unwrap();
         let sr_ds = sr_ds.unwrap().0;
 
         let shift = (sr_ds - sr0).num_seconds();
@@ -298,13 +324,13 @@ mod tests {
         // Low altitude observer
         let calc_low =
             SolarCalc { lat, lon, alt: 0.0, delta_t, refr: refraction, target: target_alt };
-        let (tw_low, _) = calc_low.solve_from_noon(noon);
+        let (tw_low, _) = calc_low.solve_from_noon(noon).unwrap();
         let tw_low = tw_low.unwrap().0;
 
         // High altitude observer
         let calc_high =
             SolarCalc { lat, lon, alt: 2000.0, delta_t, refr: refraction, target: target_alt };
-        let (tw_high, _) = calc_high.solve_from_noon(noon);
+        let (tw_high, _) = calc_high.solve_from_noon(noon).unwrap();
         let tw_high = tw_high.unwrap().0;
 
         let diff = (tw_high - tw_low).num_seconds().abs();
@@ -367,7 +393,7 @@ mod tests {
                 let noon_res = calc.get_transit(date).expect("Failed to get transit at equator");
                 let noon = calc.extract_transit_time(&noon_res);
 
-                let (sr, ss) = calc.solve_from_noon(noon);
+                let (sr, ss) = calc.solve_from_noon(noon).expect("SPA failed at equator");
 
                 assert!(
                     sr.is_some() && ss.is_some(),
@@ -405,7 +431,10 @@ mod tests {
             };
             let noon = calc.extract_transit_time(&noon_res);
 
-            let (sr, ss) = calc.solve_from_noon(noon);
+            let (sr, ss) = match calc.solve_from_noon(noon) {
+                Ok(pair) => pair,
+                Err(_) => continue, // SPA out-of-range for extreme years
+            };
 
             let sr = sr.unwrap().0;
             let ss = ss.unwrap().0;
