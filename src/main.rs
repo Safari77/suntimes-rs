@@ -463,12 +463,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Yearly optimization
-    let yearly_optimization_result = if args.solarpanel_yearly_adjustments.is_some()
-        && args.solarpanel_size.is_some()
-    {
-        let num_adjustments = args.solarpanel_yearly_adjustments.unwrap();
-
+    let yearly_optimization_result = None;
+    if let Some(num_adjustments) = args.solarpanel_yearly_adjustments {
         // Build constraints from CLI arguments
         let constraints = optimize::OptimizationConstraints::default()
             .with_tilt_range(args.solarpanel_tilt_range)
@@ -767,10 +763,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Calculate and show tracking comparison
-            if let Some(ref positions) = sun_positions {
+            if let (Some(positions), Some(panel_size)) = (&sun_positions, args.solarpanel_size) {
                 let tracking_config = solar_panel::SolarPanelConfig::new(
-                    args.solarpanel_size.unwrap(),
-                    0.0, // Ignored for dual-axis tracking
+                    panel_size, 0.0, // Ignored for dual-axis tracking
                     0.0, // Ignored for dual-axis tracking
                 )
                 .with_efficiency(args.solarpanel_efficiency)
