@@ -326,7 +326,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let uv_current = uv::calculate_uv_index(
         panel_output_pos.elevation_angle(),
-        current_conditions.irradiance.ghi,
         current_conditions.air_mass,
         args.latitude,
         month,
@@ -344,7 +343,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let uv_max = uv::calculate_uv_index(
         transit_pos.elevation_angle(),
-        noon_conditions.irradiance.ghi,
         noon_conditions.air_mass,
         args.latitude,
         month,
