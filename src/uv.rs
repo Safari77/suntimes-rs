@@ -1,6 +1,150 @@
 //! UV Index Calculation Module
 //!
-//! Based on empirical models for Ozone column estimation and UV transmission.
+//! Old code based on empirical models for Ozone column estimation and UV transmission is
+//! `calculate_uv_index_formula`.
+//! New default `calculate_uv_index` is based on high-resolution Copernicus offline
+//! atmospheric data (Ozone, AOD, Albedo) and standard UV transmission models.
+//!
+
+use bytemuck::{Pod, Zeroable};
+use std::sync::OnceLock;
+
+// A macro to easily load and align our file at compile time
+macro_rules! include_bytes_aligned {
+    ($align_to:expr, $path:expr) => {{
+        #[repr(C, align($align_to))]
+        struct __Aligned<T: ?Sized>(T);
+
+        const __DATA: &'static __Aligned<[u8; include_bytes!($path).len()]> =
+            &__Aligned(*include_bytes!($path));
+
+        &__DATA.0
+    }};
+}
+
+// --- 2. OFFLINE DATABASE STRUCTURES ---
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct BlobHeader {
+    pub granularity: u32,
+    pub time_steps: u32,
+    pub lats: u32,
+    pub lons: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct GridCell {
+    pub ozone_du: f32,
+    pub aod_310: f32,
+    pub albedo: f32,
+}
+
+// --- GLOBAL DATABASE SINGLETON ---
+static ATMOSPHERE_DB: OnceLock<AtmosphereData> = OnceLock::new();
+
+/// Internal helper to get the database, initializing it instantly on the first call.
+fn get_db() -> &'static AtmosphereData {
+    ATMOSPHERE_DB.get_or_init(|| AtmosphereData::new())
+}
+
+pub struct AtmosphereData {
+    pub header: BlobHeader,
+    // The data now lives permanently in the binary's read-only memory segment
+    data: &'static [GridCell],
+}
+
+impl AtmosphereData {
+    pub fn new() -> Self {
+        let raw_bytes = include_bytes_aligned!(4, "../assets/atmosphere_grid.bin");
+        let header_size = std::mem::size_of::<BlobHeader>();
+        assert!(raw_bytes.len() >= header_size, "Embedded blob is too small!");
+
+        let (header_bytes, data_bytes) = raw_bytes.split_at(header_size);
+        let header: &BlobHeader = bytemuck::from_bytes(header_bytes);
+        let data: &[GridCell] = bytemuck::cast_slice(data_bytes);
+        let expected = (header.time_steps * header.lats * header.lons) as usize;
+        assert_eq!(
+            data.len(),
+            expected,
+            "Blob data length {} != expected {} from header",
+            data.len(),
+            expected
+        );
+
+        #[cfg(debug_assertions)]
+        {
+            println!("=== [DEBUG: ATMOSPHERE DB INIT] ===");
+            println!("Header Loaded: {:#?}", header);
+            println!(
+                "Expected Data Length: {} cells",
+                header.time_steps * header.lats * header.lons
+            );
+            println!("Actual Data Length: {} cells", data.len());
+            if let Some(first) = data.first() {
+                println!("First cell (Day 1, -90 Lat, -180 Lon): {:#?}", first);
+            }
+            println!("===================================");
+        }
+
+        Self { header: *header, data }
+    }
+
+    pub fn get_cell(&self, day_of_year: u32, lat: f64, lon: f64) -> GridCell {
+        let lats = self.header.lats as usize;
+        let lons = self.header.lons as usize;
+        let lat_step = 180.0 / lats as f64;
+        let lon_step = 360.0 / lons as f64;
+
+        let time_idx = ((day_of_year.saturating_sub(1)) / self.header.granularity)
+            .min(self.header.time_steps - 1) as usize;
+
+        // Latitude: clamp at poles (no wrap)
+        let lat_f = ((lat + 90.0) / lat_step).clamp(0.0, (lats - 1) as f64);
+        let lat0 = lat_f.floor() as usize;
+        let lat1 = (lat0 + 1).min(lats - 1);
+        let lat_t = (lat_f - lat0 as f64) as f32;
+
+        // Longitude: wrap (the dataset spans -180..180 with no duplicate at 180)
+        let lon_f = (lon + 180.0) / lon_step;
+        let lon0 = (lon_f.floor() as isize).rem_euclid(lons as isize) as usize;
+        let lon1 = (lon0 + 1) % lons;
+        let lon_t = (lon_f - lon_f.floor()) as f32;
+
+        let i = |la: usize, lo: usize| time_idx * lats * lons + la * lons + lo;
+        let (a, b, c, d) = (
+            self.data[i(lat0, lon0)],
+            self.data[i(lat0, lon1)],
+            self.data[i(lat1, lon0)],
+            self.data[i(lat1, lon1)],
+        );
+
+        let blerp = |p00: f32, p01: f32, p10: f32, p11: f32| {
+            let r0 = p00 * (1.0 - lon_t) + p01 * lon_t;
+            let r1 = p10 * (1.0 - lon_t) + p11 * lon_t;
+            r0 * (1.0 - lat_t) + r1 * lat_t
+        };
+
+        GridCell {
+            ozone_du: blerp(a.ozone_du, b.ozone_du, c.ozone_du, d.ozone_du),
+            aod_310: blerp(a.aod_310, b.aod_310, c.aod_310, d.aod_310),
+            albedo: blerp(a.albedo, b.albedo, c.albedo, d.albedo),
+        }
+    }
+}
+
+// --- 2. UV PHYSICS CALCULATION ---
+pub fn estimate_ozone_column(day_of_year: u32, lat: f64, lon: f64, altitude_m: f64) -> f64 {
+    let cell = get_db().get_cell(day_of_year, lat, lon);
+
+    let mut ozone_du = cell.ozone_du as f64;
+    let altitude_km = (altitude_m / 1000.0).clamp(0.0, 11.0);
+    let elevation_correction = 1.0 - (0.010 * altitude_km);
+    ozone_du *= elevation_correction;
+
+    ozone_du.clamp(100.0, 500.0)
+}
 
 /// Global monthly ozone climatology (Dobson Units) dataset based on modern OMI/TOMS satellite data
 /// Rows: 9 latitude band centers from -80° to +80° (every 20°);
@@ -64,10 +208,8 @@ fn lookup_ozone_bilinear(latitude: f64, frac_month: f64) -> f64 {
 /// tropospheric altitude correction on top.
 ///
 /// Note: This function is called from inner loops in yearly optimization, so
-/// it deliberately performs no I/O. Callers that want to surface the
-/// ozone-hole caveat should check [`is_ozone_hole_season`] once at the top
-/// level and print their own message.
-pub fn estimate_ozone_column(latitude: f64, month: u32, altitude_m: f64) -> f64 {
+/// it deliberately performs no I/O.
+pub fn estimate_ozone_column_formula(latitude: f64, month: u32, altitude_m: f64) -> f64 {
     // 1. Map integer month to its column (mid-month value); latitude is interpolated
     //    bilinearly against neighboring band centers. Callers wanting smooth time
     //    interpolation can drive lookup_ozone_bilinear with a fractional month.
@@ -89,14 +231,6 @@ pub fn estimate_ozone_column(latitude: f64, month: u32, altitude_m: f64) -> f64 
     ozone_du.clamp(100.0, 500.0)
 }
 
-/// True if the climatology-driven UV index at this latitude & month is likely
-/// to underestimate reality due to seasonal Antarctic ozone depletion.
-///
-/// Southern Hemisphere, poleward of 60°S, September through November.
-pub fn is_ozone_hole_season(latitude: f64, month: u32) -> bool {
-    latitude < -60.0 && (9..=11).contains(&month)
-}
-
 /// Calculate Angstrom Aerosol Optical Depth at specific wavelength
 fn angstrom_aod(aod0: f64, lambda0: f64, lambda1: f64, alpha: f64) -> f64 {
     aod0 * (lambda1 / lambda0).powf(-alpha)
@@ -115,14 +249,56 @@ fn aerosol_airmass(solar_elevation_deg: f64) -> f64 {
     1.0 / (h.to_radians().sin() + 0.0548 * (h + 2.65).powf(-1.452))
 }
 
-/// Calculates clear-sky UV Index using an empirical Solar Zenith Angle parameterization adjusted
-/// for ozone, aerosols, altitude, and albedo.
-pub fn calculate_uv_index(solar_elevation: f64, latitude: f64, month: u32, altitude_m: f64) -> f64 {
+pub fn calculate_uv_index(
+    solar_elevation: f64,
+    day_of_year: u32,
+    lat: f64,
+    lon: f64,
+    altitude_m: f64,
+) -> f64 {
     if solar_elevation <= 0.0 {
         return 0.0;
     }
 
-    let ozone_du = estimate_ozone_column(latitude, month, altitude_m);
+    // Automatically grabs the global singleton
+    let cell = get_db().get_cell(day_of_year, lat, lon);
+    let altitude_km = altitude_m / 1000.0;
+
+    let ozone_du = estimate_ozone_column(day_of_year, lat, lon, altitude_m);
+    let mu = solar_elevation.to_radians().sin();
+    let uv_ozone = 12.5 * mu.powf(2.42) * (300.0 / ozone_du).powf(1.2);
+
+    const AEROSOL_SCALE_HEIGHT_KM: f64 = 1.5;
+    let aod_uv = (cell.aod_310 as f64) * (-altitude_km / AEROSOL_SCALE_HEIGHT_KM).exp();
+    let m_aerosol = aerosol_airmass(solar_elevation);
+    let aerosol_trans = (-0.5 * aod_uv * m_aerosol).exp();
+
+    // 4. Surface Albedo (Reflection)
+    let raw_albedo = cell.albedo as f64;
+
+    // If it's our 1.02 fallback from a missing dataset, use it directly.
+    // Otherwise, apply the standard enhancement formula: 1.0 + (albedo * 0.25).
+    // Example: Dirt (0.05) -> 1.0125 multiplier. Snow (0.80) -> 1.20 multiplier.
+    let albedo_factor = if raw_albedo >= 1.0 { raw_albedo } else { 1.0 + (0.25 * raw_albedo) };
+    let altitude_correction = 1.0 + (0.05 * altitude_km);
+
+    let uv_index = uv_ozone * aerosol_trans * albedo_factor * altitude_correction;
+    uv_index.clamp(0.0, 16.0)
+}
+
+/// Calculates clear-sky UV Index using an empirical Solar Zenith Angle parameterization adjusted
+/// for ozone, aerosols, altitude, and albedo.
+pub fn calculate_uv_index_formula(
+    solar_elevation: f64,
+    latitude: f64,
+    month: u32,
+    altitude_m: f64,
+) -> f64 {
+    if solar_elevation <= 0.0 {
+        return 0.0;
+    }
+
+    let ozone_du = estimate_ozone_column_formula(latitude, month, altitude_m);
     let altitude_km = altitude_m / 1000.0;
 
     // Solar zenith angle conversion
@@ -142,7 +318,7 @@ pub fn calculate_uv_index(solar_elevation: f64, latitude: f64, month: u32, altit
     // accounting for the diffuse forward-scattered contribution that still
     // reaches the surface.
     const AEROSOL_SCALE_HEIGHT_KM: f64 = 1.5;
-    let aod_uv_sea_level = angstrom_aod(0.04, 550.0, 310.0, 1.3);
+    let aod_uv_sea_level = angstrom_aod(0.15, 550.0, 310.0, 1.3);
     let aod_uv = aod_uv_sea_level * (-altitude_km / AEROSOL_SCALE_HEIGHT_KM).exp();
     let m_aerosol = aerosol_airmass(solar_elevation);
     let aerosol_trans = (-0.5 * aod_uv * m_aerosol).exp();
@@ -167,12 +343,12 @@ mod tests {
     #[test]
     fn test_ozone_estimation_seasonal_bounds() {
         // NH Mid-latitudes: April (Month 4) should have higher ozone than October (Month 10)
-        let spring = estimate_ozone_column(45.0, 4, 0.0);
-        let fall = estimate_ozone_column(45.0, 10, 0.0);
+        let spring = estimate_ozone_column_formula(45.0, 4, 0.0);
+        let fall = estimate_ozone_column_formula(45.0, 10, 0.0);
         assert!(spring > fall, "NH Spring ozone ({}) should be > Fall ({})", spring, fall);
 
         // Tropics should be consistently lower than mid-latitudes
-        let tropics = estimate_ozone_column(0.0, 1, 0.0);
+        let tropics = estimate_ozone_column_formula(0.0, 1, 0.0);
         assert!(tropics < 300.0);
     }
 
@@ -180,26 +356,26 @@ mod tests {
     fn test_uvi_benchmarks() {
         // Benchmark 1: Tropical Noon (Zenith sun, high GHI, low airmass, low ozone)
         // Result should be "Extreme" (11+)
-        let uvi_tropics = calculate_uv_index(90.0, 0.0, 3, 0.0);
+        let uvi_tropics = calculate_uv_index_formula(90.0, 0.0, 3, 0.0);
         assert!(uvi_tropics > 11.0, "Tropical noon UVI should be extreme, got {}", uvi_tropics);
 
         // Benchmark 2: Mid-latitude Summer Noon (45N, ~68 elev, June/Month 6)
         // Result should be "Very High" (8-10)
-        let uvi_summer = calculate_uv_index(68.0, 45.0, 6, 0.0);
+        let uvi_summer = calculate_uv_index_formula(68.0, 45.0, 6, 0.0);
         assert!(uvi_summer > 7.0 && uvi_summer < 11.0, "Summer UVI {} out of range", uvi_summer);
 
         // Benchmark 3: Mid-latitude Winter Noon (45N, ~22 elev, Dec/Month 12)
         // Result should be "Low" (< 2)
-        let uvi_winter = calculate_uv_index(22.0, 45.0, 12, 0.0);
+        let uvi_winter = calculate_uv_index_formula(22.0, 45.0, 12, 0.0);
         assert!(uvi_winter < 2.0, "Winter UVI {} must be low (< 2.0)", uvi_winter);
     }
 
     #[test]
     fn test_stratospheric_uv_resilience() {
         // Sea level: Month 6, altitude 0m
-        let uvi_sea = calculate_uv_index(60.0, 45.0, 6, 0.0);
+        let uvi_sea = calculate_uv_index_formula(60.0, 45.0, 6, 0.0);
         // Stratosphere (11km): Less ozone above city
-        let uvi_11km = calculate_uv_index(60.0, 45.0, 6, 11000.0);
+        let uvi_11km = calculate_uv_index_formula(60.0, 45.0, 6, 11000.0);
 
         assert!(
             uvi_11km > uvi_sea * 1.5,
@@ -216,7 +392,7 @@ mod tests {
         let month = 6;
         let sun_elevation = 46.0;
 
-        let uvi = calculate_uv_index(sun_elevation, latitude, month, 200.0);
+        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 200.0);
 
         // Expected: Moderate (3-6)
         assert!(uvi >= 3.0 && uvi <= 6.0, "Lapland summer UVI {} should be moderate", uvi);
@@ -229,7 +405,7 @@ mod tests {
         let month = 3;
         let sun_elevation = 90.0;
 
-        let uvi = calculate_uv_index(sun_elevation, latitude, month, 2850.0);
+        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 2850.0);
 
         // Quito has extreme UV (>14) due to low ozone and altitude correction
         assert!(uvi > 14.0, "Quito equinox UVI {} should be extreme (>14)", uvi);
@@ -242,7 +418,7 @@ mod tests {
         let month = 1;
         let sun_elevation = 81.5;
 
-        let uvi = calculate_uv_index(sun_elevation, latitude, month, 30.0);
+        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 30.0);
 
         // Australian summer UVI is notoriously extreme (11+)
         assert!(uvi >= 11.0, "Australian summer UVI {} should be extreme (>=11)", uvi);
@@ -250,8 +426,8 @@ mod tests {
 
     #[test]
     fn test_zero_uvi_at_night() {
-        assert_eq!(calculate_uv_index(-5.0, 10.0, 6, 0.0), 0.0);
-        assert_eq!(calculate_uv_index(0.0, 40.0, 6, 0.0), 0.0);
+        assert_eq!(calculate_uv_index_formula(-5.0, 10.0, 6, 0.0), 0.0);
+        assert_eq!(calculate_uv_index_formula(0.0, 40.0, 6, 0.0), 0.0);
     }
 
     #[test]
@@ -259,8 +435,8 @@ mod tests {
         // Bilinear interpolation should produce a smooth gradient across the old
         // 20°-band boundaries. With the previous floor() lookup, lat 49.9 vs 50.1
         // jumped from row 6 to row 7 → ~25 DU step in summer. Now should be smooth.
-        let a = estimate_ozone_column(49.9, 6, 0.0);
-        let b = estimate_ozone_column(50.1, 6, 0.0);
+        let a = estimate_ozone_column_formula(49.9, 6, 0.0);
+        let b = estimate_ozone_column_formula(50.1, 6, 0.0);
         assert!((a - b).abs() < 1.0, "Latitude transition not smooth: {} vs {}", a, b);
     }
 
@@ -268,11 +444,78 @@ mod tests {
     fn test_antarctic_ozone_hole_value_not_clamped() {
         // 80°S, October — the climatology has 140 DU here. The previous clamp at
         // 150 DU was incorrectly raising it; the new 100 DU floor lets it through.
-        let ozone = estimate_ozone_column(-80.0, 10, 0.0);
+        let ozone = estimate_ozone_column_formula(-80.0, 10, 0.0);
         assert!(
             ozone < 145.0,
             "Antarctic October ozone {} should reflect 140 DU table value",
             ozone
+        );
+    }
+
+    #[test]
+    fn test_blob_zero_uvi_at_night() {
+        // Sun below horizon should always safely short-circuit to 0.0[cite: 2]
+        let uvi = calculate_uv_index(-5.0, 180, 60.2, 25.3, 50.0);
+        assert_eq!(uvi, 0.0, "Nighttime UV must be exactly 0.0");
+    }
+
+    #[test]
+    fn test_blob_extreme_altitude_andes() {
+        // Location: Altiplano, Andes Mountains (near Equator/Peru)
+        // Extreme altitude (~4000m), overhead sun (90°).
+        // This is consistently one of the highest UV areas on Earth.
+        let uvi = calculate_uv_index(90.0, 355, -15.0, -70.0, 4000.0);
+
+        assert!(uvi > 15.0, "Andes extreme altitude UVI ({}) should be > 14.0", uvi);
+    }
+
+    #[test]
+    fn test_blob_stratospheric_boost() {
+        // Compare Sipoo at sea level vs an airplane at 11km (tropopause).
+        // The airplane bypasses almost all aerosol attenuation and tropospheric ozone.
+        let lat = 60.0;
+        let lon = 25.0;
+        let day = 200; // Mid-summer
+        let sun_elev = 50.0;
+
+        let uvi_sea_level = calculate_uv_index(sun_elev, day, lat, lon, 0.0);
+        let uvi_11km = calculate_uv_index(sun_elev, day, lat, lon, 11000.0);
+
+        assert!(
+            uvi_11km > uvi_sea_level * 2.0,
+            "11km altitude UVI ({:.2}) should be heavily boosted over sea level ({:.2})",
+            uvi_11km,
+            uvi_sea_level
+        );
+    }
+
+    #[test]
+    fn test_blob_sipoo_summer_baseline() {
+        // Baseline sanity check for Southern Finland using typical August data
+        let uvi = calculate_uv_index(45.0, 225, 60.0, 25.0, 50.0);
+
+        // At 45 deg sun elevation, UV should be moderate (typically 3.0 to 5.0)
+        assert!(
+            uvi > 3.0 && uvi < 5.0,
+            "Sipoo summer baseline ({:.2}) seems entirely outside expected moderate bounds",
+            uvi
+        );
+    }
+
+    #[test]
+    fn test_blob_antarctic_ozone_hole() {
+        // Location: Halley Research Station, Antarctica
+        // Time: Late October (Day 295), which is peak ozone hole season.
+        // Even with a low sun angle (30°), the missing ozone + snow albedo
+        // causes surprisingly dangerous UV levels.
+        let uvi = calculate_uv_index(30.0, 295, -75.5, -26.6, 30.0);
+
+        // If this was a normal mid-latitude with a 30° sun, UV would be ~1.5.
+        // Because of the ozone hole and snow, it should be significantly higher.
+        assert!(
+            uvi > 4.5,
+            "Antarctic UV ({:.2}) is too low; ozone hole or snow albedo physics might be failing",
+            uvi
         );
     }
 }

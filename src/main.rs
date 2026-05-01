@@ -300,26 +300,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Current UV (at target time)
     let month = date.month();
 
-    // Fire the Antarctic ozone-hole caveat exactly once (if applicable),
-    // rather than inside uv::calculate_uv_index which runs in hot loops.
-    if uv::is_ozone_hole_season(args.latitude, month) {
-        eprintln!(
-            "Warning: Significant ozone depletion possible at lat {:.1} during month {}. \
-             Climatology may overestimate UVI.",
-            args.latitude, month
-        );
-    }
-
-    let uv_current = uv::calculate_uv_index(
-        panel_output_pos.elevation_angle(),
-        args.latitude,
-        month,
-        args.altitude,
-    );
+    let uv_current = if args.formula_calcs {
+        uv::calculate_uv_index_formula(
+            panel_output_pos.elevation_angle(),
+            args.latitude,
+            month,
+            args.altitude,
+        )
+    } else {
+        uv::calculate_uv_index(
+            panel_output_pos.elevation_angle(),
+            day_of_year,
+            args.latitude,
+            args.longitude,
+            args.altitude,
+        )
+    };
 
     // 2. Max UV (at Solar Noon)
-    let uv_max =
-        uv::calculate_uv_index(transit_pos.elevation_angle(), args.latitude, month, args.altitude);
+    let uv_max = if args.formula_calcs {
+        uv::calculate_uv_index_formula(
+            transit_pos.elevation_angle(),
+            args.latitude,
+            month,
+            args.altitude,
+        )
+    } else {
+        uv::calculate_uv_index(
+            transit_pos.elevation_angle(),
+            day_of_year,
+            args.latitude,
+            args.longitude,
+            args.altitude,
+        )
+    };
 
     let uv_data = Some((uv_current, uv_max));
 

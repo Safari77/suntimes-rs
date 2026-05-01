@@ -97,6 +97,9 @@ pub struct Args {
     /// Use UTC time zone
     #[arg(long)]
     pub utc: bool,
+    /// Use the old empirical formula-based model for UV Index calculations
+    #[arg(long)]
+    pub formula_calcs: bool,
 
     /// Show build info from Cargo.lock at time of building
     #[arg(long)]

@@ -3,6 +3,9 @@ suntimes-rs ☀️
 
 A high-precision, Rust-based CLI tool for calculating accurate sun position, sunset and sunrise times, twilight phases, UV index, and estimating solar panel energy yields. Argos support to display info in GNOME Shell status bar.
 
+Uses high-resolution, gridded Copernicus ADS data (Ozone, AOD, and Diffuse UV Albedo). This data is embedded into the compiled binary for O(1) access.
+Formula-based version available with option `--formula-calcs`.
+
 suntimes-rs goes beyond simple sunrise/sunset times; it features a robust solar energy modeling engine capable of optimizing panel tilt and azimuth, supporting solar tracking systems (dual-axis, HSAT, VSAT), and generating seasonal adjustment schedules to maximize your energy production.
 
 Conceptual model definitions
