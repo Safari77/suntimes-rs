@@ -298,20 +298,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 1. Current UV (at target time)
-    // We need GHI for UV calculation. Even if user has no panel config,
-    // we use a "dummy" config to extract the Clear-Sky GHI from the model.
-    // The dummy has 1m² area, flat (0°), south facing (180°) - orientation doesn't affect GHI/DNI.
-    let dummy_config = solar_panel::SolarPanelConfig::new(1.0, 0.0, 180.0)
-        .with_linke_turbidity(args.linke_turbidity);
-
-    let current_conditions = solar_panel::calculate_output(
-        &dummy_config,
-        panel_output_pos.elevation_angle(),
-        panel_output_pos.azimuth(),
-        args.altitude,
-        day_of_year,
-    );
-
     let month = date.month();
 
     // Fire the Antarctic ozone-hole caveat exactly once (if applicable),
@@ -326,28 +312,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let uv_current = uv::calculate_uv_index(
         panel_output_pos.elevation_angle(),
-        current_conditions.air_mass,
         args.latitude,
         month,
         args.altitude,
     );
 
     // 2. Max UV (at Solar Noon)
-    let noon_conditions = solar_panel::calculate_output(
-        &dummy_config,
-        transit_pos.elevation_angle(),
-        transit_pos.azimuth(),
-        args.altitude,
-        day_of_year,
-    );
-
-    let uv_max = uv::calculate_uv_index(
-        transit_pos.elevation_angle(),
-        noon_conditions.air_mass,
-        args.latitude,
-        month,
-        args.altitude,
-    );
+    let uv_max =
+        uv::calculate_uv_index(transit_pos.elevation_angle(), args.latitude, month, args.altitude);
 
     let uv_data = Some((uv_current, uv_max));
 
