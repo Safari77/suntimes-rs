@@ -6,6 +6,7 @@ use chrono::DateTime;
 use chrono_tz::Tz;
 use solar_positioning::types::SunriseResult;
 
+use crate::air_quality::{self, AirQualityResponse};
 use crate::solar::SunEvent;
 use crate::solar_panel::{self, SolarPanelOutput, TrackingMode};
 use crate::time::format_hms;
@@ -29,6 +30,9 @@ use crate::time::format_hms;
 /// * `solar_panel_output` - Optional solar panel output
 /// * `daily_energy` - Optional daily energy estimate
 /// * `uv_data` - Optional UV index data (current, max)
+/// * `air_quality` - Optional air-quality / pollen response
+/// * `show_aqi` - Whether to render the Air Quality section
+/// * `show_pollen` - Whether to render the Pollen Warning section
 #[allow(clippy::too_many_arguments)]
 pub fn print_argos(
     now_pos: &solar_positioning::SolarPosition,
@@ -42,6 +46,9 @@ pub fn print_argos(
     solar_panel_output: Option<&SolarPanelOutput>,
     daily_energy: Option<f64>,
     uv_data: Option<(f64, f64)>, // (Current UV, Max UV)
+    air_quality: Option<&AirQualityResponse>,
+    show_aqi: bool,
+    show_pollen: bool,
 ) {
     let elevation = now_pos.elevation_angle();
     let sunchar = if elevation > 3.0 {
@@ -111,7 +118,12 @@ pub fn print_argos(
         println!("Max today: {:.1}", max);
     }
 
-    // Section 5: Solar panel output (if configured)
+    // Section 5: Air Quality / Pollen (Argos format)
+    if let Some(aq) = air_quality {
+        print_argos_air_quality(aq, show_aqi, show_pollen);
+    }
+
+    // Section 6: Solar panel output (if configured)
     if let Some(output) = solar_panel_output {
         println!("---");
         println!("⚡ Solar Panel");
@@ -120,6 +132,58 @@ pub fn print_argos(
         println!("AOI: {:.1}°", output.irradiance.aoi_deg);
         if let Some(energy) = daily_energy {
             println!("Est. Daily: {}", solar_panel::format_energy(energy));
+        }
+    }
+}
+
+/// Render the Air Quality and Pollen Warning sections in Argos format.
+///
+/// Argos uses `---` separators between groups; each section we emit is
+/// preceded by one. If neither flag has any printable content (e.g. the
+/// API was queried but returned only trace pollen and `--aqi` is off),
+/// nothing is printed and no orphan separator appears.
+fn print_argos_air_quality(aq: &AirQualityResponse, show_aqi: bool, show_pollen: bool) {
+    if show_aqi {
+        println!("---");
+        println!("Air Quality Details:");
+        if let Some(eaqi) = aq.current.european_aqi {
+            println!("European AQI: {:.0} ({})", eaqi, air_quality::european_aqi_category(eaqi));
+        }
+        if let Some(v) = aq.current.pm2_5 {
+            println!("PM2.5: {:.1} μg/m³", v);
+        }
+        if let Some(v) = aq.current.pm10 {
+            println!("PM10: {:.1} μg/m³", v);
+        }
+        if let Some(v) = aq.current.ozone {
+            println!("O3: {:.0} μg/m³", v);
+        }
+        if let Some(v) = aq.current.nitrogen_dioxide {
+            println!("NO2: {:.0} μg/m³", v);
+        }
+        if let Some(v) = aq.current.sulphur_dioxide {
+            println!("SO2: {:.1} μg/m³", v);
+        }
+        // Dust is hidden on normal days — only show it when something
+        // unusual is happening (Saharan dust transport, sandstorms, etc.)
+        if let Some(v) = aq.current.dust
+            && v > air_quality::DUST_DISPLAY_THRESHOLD
+        {
+            println!("Dust: {:.1} μg/m³", v);
+        }
+        if let Some(v) = aq.current.aerosol_optical_depth {
+            println!("AOD: {:.2} ({})", v, air_quality::aerosol_optical_depth_category(v));
+        }
+    }
+
+    if show_pollen {
+        let readings = aq.current.pollen_readings();
+        if !readings.is_empty() {
+            println!("---");
+            println!("Pollen Warning:");
+            for r in &readings {
+                println!("{}: {} ({:.0} grains/m³)", r.display_name, r.severity.label(), r.value);
+            }
         }
     }
 }
@@ -214,6 +278,70 @@ pub fn print_uv_info(panel_output_label: &str, uv_current: f64, uv_max: f64) {
     println!("Conditions ({})", panel_output_label);
     println!("  Current       : {:.1}", uv_current);
     println!("  Max Today     : {:.1} (at solar noon)", uv_max);
+}
+
+/// Print Air Quality and Pollen sections in terminal format.
+///
+/// Mirrors the Argos sections, but uses the `=== Title ===` heading
+/// style consistent with the rest of the terminal output.
+///
+/// # Arguments
+/// * `aq` - Fetched air-quality response (cached or fresh)
+/// * `show_aqi` - Whether to render the Air Quality block
+/// * `show_pollen` - Whether to render the Pollen block (skipped when
+///   no species are above their trace threshold)
+pub fn print_air_quality_terminal(aq: &AirQualityResponse, show_aqi: bool, show_pollen: bool) {
+    if show_aqi {
+        println!();
+        println!("=== Air Quality ===");
+        if let Some(eaqi) = aq.current.european_aqi {
+            println!("European AQI : {:.0} ({})", eaqi, air_quality::european_aqi_category(eaqi));
+        }
+        if let Some(v) = aq.current.pm2_5 {
+            println!("PM2.5        : {:.1} μg/m³", v);
+        }
+        if let Some(v) = aq.current.pm10 {
+            println!("PM10         : {:.1} μg/m³", v);
+        }
+        if let Some(v) = aq.current.ozone {
+            println!("O3           : {:.0} μg/m³", v);
+        }
+        if let Some(v) = aq.current.nitrogen_dioxide {
+            println!("NO2          : {:.0} μg/m³", v);
+        }
+        if let Some(v) = aq.current.sulphur_dioxide {
+            println!("SO2          : {:.1} μg/m³", v);
+        }
+        // Hidden when below background — only show during dust events.
+        if let Some(v) = aq.current.dust
+            && v > air_quality::DUST_DISPLAY_THRESHOLD
+        {
+            println!("Dust         : {:.1} μg/m³", v);
+        }
+        if let Some(v) = aq.current.aerosol_optical_depth {
+            println!(
+                "AOD          : {:.2} ({})",
+                v,
+                air_quality::aerosol_optical_depth_category(v)
+            );
+        }
+    }
+
+    if show_pollen {
+        let readings = aq.current.pollen_readings();
+        if !readings.is_empty() {
+            println!();
+            println!("=== Pollen ===");
+            for r in &readings {
+                println!(
+                    "{:<8}: {:<10} ({:.0} grains/m³)",
+                    r.display_name,
+                    r.severity.label(),
+                    r.value
+                );
+            }
+        }
+    }
 }
 
 /// Print solar panel configuration and output.

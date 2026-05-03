@@ -7,6 +7,108 @@ use serde::Deserialize;
 
 // ===================== TYPES =====================
 
+/// Altitude argument: either a literal number (metres above MSL) or
+/// the keyword `auto`, which makes main.rs pull the value from
+/// open-meteo's `elevation` field at runtime.
+///
+/// `auto` is silently downgraded to 0.0 if the open-meteo fetch fails
+/// — by design, per CLI contract: a transient network outage should
+/// not turn a valid invocation into an error.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AltitudeArg {
+    Auto,
+    Fixed(f64),
+}
+
+impl std::fmt::Display for AltitudeArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AltitudeArg::Auto => f.write_str("auto"),
+            AltitudeArg::Fixed(v) => write!(f, "{}", v),
+        }
+    }
+}
+
+/// Privacy level controlling how coarsely we round latitude/longitude
+/// before they leave the machine (sent to open-meteo and stored as
+/// part of the cache filename).
+///
+/// Rounding precision (per coordinate axis):
+/// * `high`   → 0.1°  ≈ 11 km
+/// * `medium` → 0.01° ≈ 1.1 km
+/// * `low`    → 0.001° ≈ 110 m  (useful for mountain UV / `--altitude auto`)
+///
+/// Solar calculations always use the user's full input precision —
+/// this only affects what's sent over the network and the cache key.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationPrivacy {
+    High,
+    Medium,
+    Low,
+}
+
+impl LocationPrivacy {
+    /// Maximum number of decimal places the privacy level permits in
+    /// the outbound coordinate.
+    pub fn max_decimal_places(&self) -> u8 {
+        match self {
+            LocationPrivacy::High => 1,
+            LocationPrivacy::Medium => 2,
+            LocationPrivacy::Low => 3,
+        }
+    }
+}
+
+impl std::fmt::Display for LocationPrivacy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Match clap's lowercased ValueEnum names so default_value_t
+        // round-trips correctly through the parser.
+        let s = match self {
+            LocationPrivacy::High => "high",
+            LocationPrivacy::Medium => "medium",
+            LocationPrivacy::Low => "low",
+        };
+        f.write_str(s)
+    }
+}
+
+/// A coordinate captured from the CLI, retaining the user's original
+/// input precision
+#[derive(Clone, Copy, Debug)]
+pub struct Coordinate {
+    /// Numeric value as parsed.
+    pub value: f64,
+    /// Number of decimal places the user typed. `0` if they typed an
+    /// integer or used scientific notation without a fractional part.
+    pub user_decimal_places: u8,
+}
+
+impl Coordinate {
+    /// Format the coordinate for outbound use (URL + cache filename),
+    /// applying the *coarser* of (privacy ceiling, user precision).
+    pub fn for_api(&self, privacy: LocationPrivacy) -> String {
+        let dp = privacy.max_decimal_places().min(self.user_decimal_places) as usize;
+        // Round the f64 to that precision before formatting so that
+        // float jitter never bleeds extra (false-precision) digits in.
+        let factor = 10f64.powi(dp as i32);
+        let rounded = ((self.value * factor).round() / factor) + 0.0;
+        format!("{:.*}", dp, rounded)
+    }
+}
+
+/// Count the decimal places in a numeric string. Counts only the
+/// leading run of digits after the decimal point — anything after
+/// (e.g. an `e`-style exponent) is ignored, so we don't mis-count
+/// "55.12e1" as 4 dp.
+fn count_decimal_places(s: &str) -> u8 {
+    let frac = match s.split_once('.') {
+        Some((_, f)) => f,
+        None => return 0,
+    };
+    // Cap at 10 so this never overflows even for pathological inputs.
+    frac.chars().take_while(|c| c.is_ascii_digit()).count().min(10) as u8
+}
+
 /// Sun position model.
 ///
 /// Clap renders each variant lowercased in `--help`, preserving the original
@@ -46,7 +148,7 @@ pub struct Args {
         value_parser = parse_latitude,
         env = "ARGOS_SUNTIMES_LATITUDE",
     )]
-    pub latitude: f64,
+    pub latitude: Coordinate,
     /// Observer longitude in decimal degrees (-180 to 180)
     #[arg(
         long,
@@ -54,14 +156,22 @@ pub struct Args {
         value_parser = parse_longitude,
         env = "ARGOS_SUNTIMES_LONGITUDE",
     )]
-    pub longitude: f64,
+    pub longitude: Coordinate,
     /// Time zone to use ("system", "location", or IANA time zone name)
     #[arg(long, default_value = "system", env = "ARGOS_SUNTIMES_TIMEZONE")]
     pub timezone: String,
-    /// Observer altitude above mean sea level (meters, may be negative)
-    /// Valid range: -500m (Dead Sea) to 11000m (Troposphere limit for ISA formula)
-    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true, value_parser = parse_altitude, env = "ARGOS_SUNTIMES_ALTITUDE")]
-    pub altitude: f64,
+    /// How coarsely to round coordinates before sending to external APIs
+    /// (and using as the cache key). Solar/UV calculations always use
+    /// the full input precision regardless of this setting.
+    #[arg(long, default_value_t = LocationPrivacy::High, value_enum, env = "ARGOS_SUNTIMES_LOCATION_PRIVACY")]
+    pub location_privacy: LocationPrivacy,
+    /// Observer altitude above mean sea level (metres, may be negative)
+    /// or the keyword "auto" to pull elevation from open-meteo.
+    /// Numeric range: -500m (Dead Sea) to 11000m (Troposphere limit for ISA formula).
+    /// "auto" forces an open-meteo fetch even without --aqi/--pollen,
+    /// and silently falls back to 0.0 if the fetch fails.
+    #[arg(long, default_value_t = AltitudeArg::Fixed(0.0), allow_hyphen_values = true, value_parser = parse_altitude, env = "ARGOS_SUNTIMES_ALTITUDE")]
+    pub altitude: AltitudeArg,
 
     /// Sun position model to use
     #[arg(long, default_value_t = SunModel::Noaa, value_enum, env = "ARGOS_SUNTIMES_MODEL")]
@@ -104,6 +214,15 @@ pub struct Args {
     /// Show build info from Cargo.lock at time of building
     #[arg(long)]
     pub show_build_info: bool,
+
+    // ===================== AIR QUALITY & POLLEN =====================
+    /// Enable Air Quality Index (European AQI) and core pollutants display
+    #[arg(long, env = "ARGOS_SUNTIMES_AQI")]
+    pub aqi: bool,
+
+    /// Include regional pollen forecast (e.g., birch, grass) in output
+    #[arg(long, env = "ARGOS_SUNTIMES_POLLEN")]
+    pub pollen: bool,
 
     // ===================== SOLAR PANEL OPTIONS =====================
     /// Solar panel area in square meters (enables solar output calculation)
@@ -184,28 +303,31 @@ pub struct DepInfo {
 
 // ===================== CLI VALUE PARSERS =====================
 
-fn parse_latitude(s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
-    if !(-90.0..=90.0).contains(&v) {
-        return Err(format!("Latitude must be between -90 and 90, got {}", v));
+fn parse_latitude(s: &str) -> Result<Coordinate, String> {
+    let value: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
+    if !(-90.0..=90.0).contains(&value) {
+        return Err(format!("Latitude must be between -90 and 90, got {}", value));
     }
-    Ok(v)
+    Ok(Coordinate { value, user_decimal_places: count_decimal_places(s) })
 }
 
-fn parse_longitude(s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
-    if !(-180.0..=180.0).contains(&v) {
-        return Err(format!("Longitude must be between -180 and 180, got {}", v));
+fn parse_longitude(s: &str) -> Result<Coordinate, String> {
+    let value: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
+    if !(-180.0..=180.0).contains(&value) {
+        return Err(format!("Longitude must be between -180 and 180, got {}", value));
     }
-    Ok(v)
+    Ok(Coordinate { value, user_decimal_places: count_decimal_places(s) })
 }
 
-fn parse_altitude(s: &str) -> Result<f64, String> {
+fn parse_altitude(s: &str) -> Result<AltitudeArg, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(AltitudeArg::Auto);
+    }
     let v: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
     if !(-500.0..=11000.0).contains(&v) {
         return Err(format!("Altitude must be between -500 and 11000 meters, got {}", v));
     }
-    Ok(v)
+    Ok(AltitudeArg::Fixed(v))
 }
 
 fn parse_positive_f64(s: &str) -> Result<f64, String> {
@@ -275,4 +397,97 @@ fn parse_range(s: &str) -> Result<(f64, f64), String> {
         return Err(format!("Minimum ({}) cannot be greater than maximum ({})", min, max));
     }
     Ok((min, max))
+}
+
+// ===================== TESTS =====================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_count_decimal_places() {
+        assert_eq!(count_decimal_places("55"), 0);
+        assert_eq!(count_decimal_places("55."), 0);
+        assert_eq!(count_decimal_places("55.1"), 1);
+        assert_eq!(count_decimal_places("55.12"), 2);
+        assert_eq!(count_decimal_places("55.123"), 3);
+        assert_eq!(count_decimal_places("55.123456"), 6);
+        assert_eq!(count_decimal_places("-55.12"), 2);
+        // Trailing zeros are preserved (literal precision).
+        assert_eq!(count_decimal_places("55.10"), 2);
+        assert_eq!(count_decimal_places("55.100"), 3);
+        // Scientific notation: only the leading run of digits after
+        // the dot counts; the exponent portion is ignored.
+        assert_eq!(count_decimal_places("55.12e1"), 2);
+        // Cap at 10 to avoid surprises with absurdly long inputs.
+        assert_eq!(count_decimal_places("0.12345678901234567890"), 10);
+    }
+
+    #[test]
+    fn test_privacy_decimal_places() {
+        assert_eq!(LocationPrivacy::High.max_decimal_places(), 1);
+        assert_eq!(LocationPrivacy::Medium.max_decimal_places(), 2);
+        assert_eq!(LocationPrivacy::Low.max_decimal_places(), 3);
+    }
+
+    /// Build a Coordinate as if parsed from the given string.
+    fn coord(s: &str) -> Coordinate {
+        Coordinate { value: s.parse().unwrap(), user_decimal_places: count_decimal_places(s) }
+    }
+
+    #[test]
+    fn test_for_api_user_coarser_than_privacy() {
+        // The example from the spec: --location-privacy low --latitude 55.12
+        // → user gave 2 dp, privacy permits 3, output stays at 2 dp.
+        assert_eq!(coord("55.12").for_api(LocationPrivacy::Low), "55.12");
+        assert_eq!(coord("55.1").for_api(LocationPrivacy::Low), "55.1");
+        assert_eq!(coord("55").for_api(LocationPrivacy::Low), "55");
+        // Same input, the other privacy levels — user precision still wins
+        // because it's the coarser side.
+        assert_eq!(coord("55.12").for_api(LocationPrivacy::Medium), "55.12");
+        assert_eq!(coord("55.1").for_api(LocationPrivacy::Medium), "55.1");
+        assert_eq!(coord("55.1").for_api(LocationPrivacy::High), "55.1");
+    }
+
+    #[test]
+    fn test_for_api_privacy_coarser_than_user() {
+        // User typed more precision than the privacy level allows —
+        // the privacy ceiling kicks in and we round.
+        assert_eq!(coord("60.382517").for_api(LocationPrivacy::High), "60.4");
+        assert_eq!(coord("60.382517").for_api(LocationPrivacy::Medium), "60.38");
+        assert_eq!(coord("60.382517").for_api(LocationPrivacy::Low), "60.383");
+
+        // Negative coordinates work the same way.
+        assert_eq!(coord("-25.273881").for_api(LocationPrivacy::High), "-25.3");
+        assert_eq!(coord("-25.273881").for_api(LocationPrivacy::Medium), "-25.27");
+        assert_eq!(coord("-25.273881").for_api(LocationPrivacy::Low), "-25.274");
+    }
+
+    #[test]
+    fn test_for_api_no_padding() {
+        // Critical: don't pad. "55.12" with --location-privacy low
+        // must NOT become "55.120".
+        let s = coord("55.12").for_api(LocationPrivacy::Low);
+        assert_eq!(s, "55.12");
+        assert!(!s.contains("55.120"));
+    }
+
+    #[test]
+    fn test_parse_latitude_captures_precision() {
+        let c = parse_latitude("60.4").unwrap();
+        assert_eq!(c.value, 60.4);
+        assert_eq!(c.user_decimal_places, 1);
+
+        let c = parse_latitude("60.382517").unwrap();
+        assert_eq!(c.user_decimal_places, 6);
+
+        let c = parse_latitude("-89").unwrap();
+        assert_eq!(c.user_decimal_places, 0);
+
+        // Out of range still rejected.
+        assert!(parse_latitude("91").is_err());
+        assert!(parse_latitude("-91").is_err());
+        assert!(parse_latitude("not a number").is_err());
+    }
 }

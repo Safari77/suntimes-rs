@@ -46,7 +46,7 @@ static ATMOSPHERE_DB: OnceLock<AtmosphereData> = OnceLock::new();
 
 /// Internal helper to get the database, initializing it instantly on the first call.
 fn get_db() -> &'static AtmosphereData {
-    ATMOSPHERE_DB.get_or_init(|| AtmosphereData::new())
+    ATMOSPHERE_DB.get_or_init(AtmosphereData::new)
 }
 
 pub struct AtmosphereData {

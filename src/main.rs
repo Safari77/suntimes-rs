@@ -7,6 +7,7 @@ use solar_positioning::{
     types::{RefractionCorrection, SunriseResult},
 };
 
+mod air_quality;
 mod cli;
 mod geo;
 mod optimize;
@@ -82,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         match args.timezone.as_str() {
             "system" => system_timezone(),
-            "location" => resolve_timezone(args.longitude, args.latitude),
+            "location" => resolve_timezone(args.longitude.value, args.latitude.value),
             other => other.parse().unwrap_or(Tz::UTC),
         }
     };
@@ -115,19 +116,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let delta_t: f64 = DeltaT::estimate_from_date(date.year(), date.month())?;
 
+    // Fetch air quality / pollen / elevation if any of the relevant
+    // flags is active. The fetch is cached on disk for an hour, so
+    // calling this app every 3 seconds (typical for Argos) does not
+    // hammer the API. Failure is silent — the air-quality output
+    // sections just get skipped, and `--altitude auto` falls back to
+    // 0.0 per the documented contract.
+    let altitude_is_auto = matches!(args.altitude, cli::AltitudeArg::Auto);
+    let air_quality = if args.aqi || args.pollen || altitude_is_auto {
+        // Round coordinates per --location-privacy before they touch the
+        // network. Solar / UV calcs continue to use the full input
+        // precision via `args.{latitude,longitude}.value`.
+        let lat_key = args.latitude.for_api(args.location_privacy);
+        let lon_key = args.longitude.for_api(args.location_privacy);
+        air_quality::fetch(&lat_key, &lon_key)
+    } else {
+        None
+    };
+
+    // Resolve --altitude to a concrete metres-above-MSL value used by
+    // the rest of main(). For "auto", a missing/failed fetch falls
+    // back to 0.0 silently per the CLI contract.
+    let altitude: f64 = match args.altitude {
+        cli::AltitudeArg::Auto => air_quality.as_ref().and_then(|aq| aq.elevation).unwrap_or(0.0),
+        cli::AltitudeArg::Fixed(v) => v,
+    };
+
     // Twilight is geometric; disable refraction if twilight flag is set
     let is_twilight_mode = args.civil || args.nautical || args.astro;
     let calc = match args.model {
         cli::SunModel::Noaa => {
             let dip =
-                if is_twilight_mode { 0.0 } else { horizon_dip_deg(args.latitude, args.altitude) };
+                if is_twilight_mode { 0.0 } else { horizon_dip_deg(args.latitude.value, altitude) };
             // If twilight mode, force refr to None
             let refr = if is_twilight_mode { None } else { Some(RefractionCorrection::standard()) };
 
             SolarCalc {
-                lat: args.latitude,
-                lon: args.longitude,
-                alt: args.altitude,
+                lat: args.latitude.value,
+                lon: args.longitude.value,
+                alt: altitude,
                 delta_t,
                 refr,
                 target: base_alt - dip,
@@ -136,9 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cli::SunModel::Horizons => {
             let refr = if is_twilight_mode { None } else { Some(RefractionCorrection::standard()) };
             SolarCalc {
-                lat: args.latitude,
-                lon: args.longitude,
-                alt: args.altitude,
+                lat: args.latitude.value,
+                lon: args.longitude.value,
+                alt: altitude,
                 delta_t,
                 refr,
                 target: base_alt,
@@ -146,12 +173,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         cli::SunModel::Physical => {
             let dip =
-                if is_twilight_mode { 0.0 } else { horizon_dip_deg(args.latitude, args.altitude) };
+                if is_twilight_mode { 0.0 } else { horizon_dip_deg(args.latitude.value, altitude) };
 
             let pressure = if (args.pressure - 1013.25).abs() > f64::EPSILON {
                 args.pressure
             } else {
-                1013.25 * (1.0 - 2.25577e-5 * args.altitude).powf(5.25588)
+                1013.25 * (1.0 - 2.25577e-5 * altitude).powf(5.25588)
             };
 
             let refr = if is_twilight_mode {
@@ -161,9 +188,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             SolarCalc {
-                lat: args.latitude,
-                lon: args.longitude,
-                alt: args.altitude,
+                lat: args.latitude.value,
+                lon: args.longitude.value,
+                alt: altitude,
                 delta_t,
                 refr,
                 target: base_alt - dip,
@@ -292,7 +319,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config,
             panel_output_pos.elevation_angle(),
             panel_output_pos.azimuth(),
-            args.altitude,
+            altitude,
             day_of_year,
         )
     });
@@ -303,17 +330,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uv_current = if args.formula_calcs {
         uv::calculate_uv_index_formula(
             panel_output_pos.elevation_angle(),
-            args.latitude,
+            args.latitude.value,
             month,
-            args.altitude,
+            altitude,
         )
     } else {
         uv::calculate_uv_index(
             panel_output_pos.elevation_angle(),
             day_of_year,
-            args.latitude,
-            args.longitude,
-            args.altitude,
+            args.latitude.value,
+            args.longitude.value,
+            altitude,
         )
     };
 
@@ -321,17 +348,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uv_max = if args.formula_calcs {
         uv::calculate_uv_index_formula(
             transit_pos.elevation_angle(),
-            args.latitude,
+            args.latitude.value,
             month,
-            args.altitude,
+            altitude,
         )
     } else {
         uv::calculate_uv_index(
             transit_pos.elevation_angle(),
             day_of_year,
-            args.latitude,
-            args.longitude,
-            args.altitude,
+            args.latitude.value,
+            args.longitude.value,
+            altitude,
         )
     };
 
@@ -398,7 +425,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         sun_positions.as_ref().map(|positions| {
             solar_panel::calculate_daily_energy(
                 config,
-                args.altitude,
+                altitude,
                 day_of_year,
                 positions.iter().copied(),
             )
@@ -417,7 +444,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // HSAT: optimize tilt only (azimuth is tracked)
                     optimize::optimize_hsat_tilt(
                         *cfg,
-                        args.altitude,
+                        altitude,
                         day_of_year,
                         positions,
                         &constraints,
@@ -426,7 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // VSAT: optimize azimuth only (tilt is tracked)
                     optimize::optimize_vsat_azimuth(
                         *cfg,
-                        args.altitude,
+                        altitude,
                         day_of_year,
                         positions,
                         &constraints,
@@ -435,7 +462,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Fixed panel: optimize both tilt and azimuth
                     optimize::optimize_fixed_panel_constrained(
                         *cfg,
-                        args.altitude,
+                        altitude,
                         day_of_year,
                         positions,
                         &constraints,
@@ -560,9 +587,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // HSAT: optimize tilt adjustments with azimuth tracking
                 optimize::optimize_yearly_hsat(
                     *cfg,
-                    args.latitude,
-                    args.longitude,
-                    args.altitude,
+                    args.latitude.value,
+                    args.longitude.value,
+                    altitude,
                     year,
                     num_adjustments,
                     &constraints,
@@ -572,9 +599,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Fixed panel: optimize tilt adjustments with fixed azimuth
                 optimize::optimize_yearly_adjustments(
                     *cfg,
-                    args.latitude,
-                    args.longitude,
-                    args.altitude,
+                    args.latitude.value,
+                    args.longitude.value,
+                    altitude,
                     year,
                     num_adjustments,
                     &constraints,
@@ -600,11 +627,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             current_panel_output.as_ref(),
             daily_energy,
             uv_data,
+            air_quality.as_ref(),
+            args.aqi,
+            args.pollen,
         );
         return Ok(());
     }
 
-    println!("Location : lat={:.6}, lon={:.6}", args.latitude, args.longitude);
+    println!(
+        "Location : lat={:.6}, lon={:.6}, alt={:.1}m",
+        args.latitude.value, args.longitude.value, altitude
+    );
     println!("Timezone : {}", tz);
     println!("Date     : {}", date.date_naive());
     println!("Target altitude : {:.6}°", calc.target);
@@ -619,7 +652,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config,
                 pos.elevation_angle(),
                 pos.azimuth(),
-                args.altitude,
+                altitude,
                 day_of_year,
             );
             output::print_solar_panel_at_time(dt, &at_output);
@@ -642,6 +675,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if target_dt.is_none() {
         output::print_uv_info(&panel_output_label, uv_current, uv_max);
+    }
+
+    if let Some(ref aq) = air_quality {
+        output::print_air_quality_terminal(aq, args.aqi, args.pollen);
     }
 
     if let Some(ref config) = panel_config
@@ -759,7 +796,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let tracking_energy = solar_panel::calculate_daily_energy(
                     &tracking_config,
-                    args.altitude,
+                    altitude,
                     day_of_year,
                     positions.iter().copied(),
                 );
