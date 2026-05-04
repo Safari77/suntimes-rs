@@ -630,6 +630,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             air_quality.as_ref(),
             args.aqi,
             args.pollen,
+            &args.aqi_display,
         );
         return Ok(());
     }
@@ -678,7 +679,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if let Some(ref aq) = air_quality {
-        output::print_air_quality_terminal(aq, args.aqi, args.pollen);
+        output::print_air_quality_terminal(aq, args.aqi, args.pollen, &args.aqi_display);
     }
 
     if let Some(ref config) = panel_config

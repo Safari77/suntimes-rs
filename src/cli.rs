@@ -136,6 +136,31 @@ impl std::fmt::Display for SunModel {
     }
 }
 
+/// Individual pollutants that the `--aqi-display` filter can select.
+///
+/// Variant `value` names match the Open-Meteo air-quality API field
+/// names verbatim (`pm2_5`, `nitrogen_dioxide`, …) so the CLI vocabulary
+/// is the same as the API documentation. `european_aqi` and
+/// `aerosol_optical_depth` are intentionally NOT in this enum: they are
+/// always shown when `--aqi` is set, regardless of `--aqi-display`.
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AqiPollutant {
+    #[value(name = "pm10")]
+    Pm10,
+    #[value(name = "pm2_5")]
+    Pm25,
+    #[value(name = "nitrogen_dioxide")]
+    NitrogenDioxide,
+    #[value(name = "carbon_monoxide")]
+    CarbonMonoxide,
+    #[value(name = "ozone")]
+    Ozone,
+    #[value(name = "sulphur_dioxide")]
+    SulphurDioxide,
+    #[value(name = "dust")]
+    Dust,
+}
+
 // ===================== CLI =====================
 
 #[derive(Parser, Debug)]
@@ -223,6 +248,17 @@ pub struct Args {
     /// Include regional pollen forecast (e.g., birch, grass) in output
     #[arg(long, env = "ARGOS_SUNTIMES_POLLEN")]
     pub pollen: bool,
+
+    /// Pollutants to include in the air-quality display. Comma-separated subset
+    /// of: pm10, pm2_5, nitrogen_dioxide, carbon_monoxide, ozone,
+    /// sulphur_dioxide, dust. If omitted (the default), all are displayed.
+    /// `european_aqi` and `aerosol_optical_depth` are always shown when --aqi
+    /// is set. The display order is fixed by the program; this flag only
+    /// filters. All values are always fetched and cached regardless of this
+    /// flag, so flipping it between invocations does not trigger extra API
+    /// calls.
+    #[arg(long, value_delimiter = ',', env = "ARGOS_SUNTIMES_AQI_DISPLAY")]
+    pub aqi_display: Vec<AqiPollutant>,
 
     // ===================== SOLAR PANEL OPTIONS =====================
     /// Solar panel area in square meters (enables solar output calculation)

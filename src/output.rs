@@ -7,6 +7,7 @@ use chrono_tz::Tz;
 use solar_positioning::types::SunriseResult;
 
 use crate::air_quality::{self, AirQualityResponse};
+use crate::cli::AqiPollutant;
 use crate::solar::SunEvent;
 use crate::solar_panel::{self, SolarPanelOutput, TrackingMode};
 use crate::time::format_hms;
@@ -33,6 +34,9 @@ use crate::time::format_hms;
 /// * `air_quality` - Optional air-quality / pollen response
 /// * `show_aqi` - Whether to render the Air Quality section
 /// * `show_pollen` - Whether to render the Pollen Warning section
+/// * `aqi_display` - Filter selecting which of the 7 per-pollutant lines
+///   to render under Air Quality (empty = all). `european_aqi` and
+///   `aerosol_optical_depth` are always shown.
 #[allow(clippy::too_many_arguments)]
 pub fn print_argos(
     now_pos: &solar_positioning::SolarPosition,
@@ -49,6 +53,7 @@ pub fn print_argos(
     air_quality: Option<&AirQualityResponse>,
     show_aqi: bool,
     show_pollen: bool,
+    aqi_display: &[AqiPollutant],
 ) {
     let elevation = now_pos.elevation_angle();
     let sunchar = if elevation > 3.0 {
@@ -120,7 +125,7 @@ pub fn print_argos(
 
     // Section 5: Air Quality / Pollen (Argos format)
     if let Some(aq) = air_quality {
-        print_argos_air_quality(aq, show_aqi, show_pollen);
+        print_argos_air_quality(aq, show_aqi, show_pollen, aqi_display);
     }
 
     // Section 6: Solar panel output (if configured)
@@ -136,46 +141,151 @@ pub fn print_argos(
     }
 }
 
+/// Default unit string for concentrations when Open-Meteo omits the
+/// field's unit from `current_units` (in practice it always returns it,
+/// but cache files written before that field was tracked won't have it).
+const DEFAULT_CONCENTRATION_UNIT: &str = "μg/m³";
+
+/// Width of the value column in argos AQI lines. Categories get
+/// right-aligned in their own column right after, so longer values just
+/// push the category right-edge but stay readable.
+const ARGOS_AQI_VALUE_WIDTH: usize = 28;
+
+/// Width of the right-aligned category column in argos AQI lines.
+const ARGOS_AQI_CATEGORY_WIDTH: usize = 10;
+
+/// Format one argos AQI line with a left-aligned label/value/unit
+/// segment and a right-aligned category segment.
+///
+/// `unit` may be empty (e.g. AOD, EAQI label) — in that case no trailing
+/// space and no unit are emitted before the category column.
+fn print_argos_aqi_line(label: &str, value_str: &str, unit: &str, category: &str) {
+    let val_part = if unit.is_empty() {
+        format!("{}: {}", label, value_str)
+    } else {
+        format!("{}: {} {}", label, value_str, unit)
+    };
+    println!(
+        "{:<value_w$}{:>cat_w$}",
+        val_part,
+        category,
+        value_w = ARGOS_AQI_VALUE_WIDTH,
+        cat_w = ARGOS_AQI_CATEGORY_WIDTH,
+    );
+}
+
 /// Render the Air Quality and Pollen Warning sections in Argos format.
 ///
 /// Argos uses `---` separators between groups; each section we emit is
 /// preceded by one. If neither flag has any printable content (e.g. the
 /// API was queried but returned only trace pollen and `--aqi` is off),
 /// nothing is printed and no orphan separator appears.
-fn print_argos_air_quality(aq: &AirQualityResponse, show_aqi: bool, show_pollen: bool) {
+///
+/// `aqi_display` filters the 7 per-pollutant lines (PM10, PM2.5, NO2,
+/// CO, O3, SO2, dust). Empty slice = show all. The European AQI and
+/// AOD lines are always shown when `--aqi` is set. All lines (including
+/// European AQI and AOD) use the same right-justified category column
+/// for visual consistency.
+fn print_argos_air_quality(
+    aq: &AirQualityResponse,
+    show_aqi: bool,
+    show_pollen: bool,
+    aqi_display: &[AqiPollutant],
+) {
+    // Empty filter == show everything; otherwise only show what was listed.
+    let show = |p: AqiPollutant| aqi_display.is_empty() || aqi_display.contains(&p);
+
     if show_aqi {
         println!("---");
         println!("Air Quality Details:");
+        // European AQI and AOD have no displayable unit (their API
+        // `current_units` values are "EAQI" — redundant with the label —
+        // and "" respectively), so they go through the same right-justified
+        // helper as the 7 per-pollutant lines, just with an empty unit.
         if let Some(eaqi) = aq.current.european_aqi {
-            println!("European AQI: {:.0} ({})", eaqi, air_quality::european_aqi_category(eaqi));
+            print_argos_aqi_line(
+                "European AQI",
+                &format!("{:.0}", eaqi),
+                "",
+                air_quality::european_aqi_category(eaqi),
+            );
         }
-        if let Some(v) = aq.current.pm2_5 {
-            println!("PM2.5: {:.1} μg/m³", v);
+        if show(AqiPollutant::Pm25)
+            && let Some(v) = aq.current.pm2_5
+        {
+            let unit = aq.current_units.pm2_5.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            print_argos_aqi_line(
+                "PM2.5",
+                &format!("{:.1}", v),
+                unit,
+                air_quality::pm25_category(v),
+            );
         }
-        if let Some(v) = aq.current.pm10 {
-            println!("PM10: {:.1} μg/m³", v);
+        if show(AqiPollutant::Pm10)
+            && let Some(v) = aq.current.pm10
+        {
+            let unit = aq.current_units.pm10.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            print_argos_aqi_line("PM10", &format!("{:.1}", v), unit, air_quality::pm10_category(v));
         }
-        if let Some(v) = aq.current.ozone {
-            println!("O3: {:.0} μg/m³", v);
+        if show(AqiPollutant::Ozone)
+            && let Some(v) = aq.current.ozone
+        {
+            let unit = aq.current_units.ozone.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            print_argos_aqi_line("O3", &format!("{:.0}", v), unit, air_quality::ozone_category(v));
         }
-        if let Some(v) = aq.current.nitrogen_dioxide {
-            println!("NO2: {:.0} μg/m³", v);
+        if show(AqiPollutant::NitrogenDioxide)
+            && let Some(v) = aq.current.nitrogen_dioxide
+        {
+            let unit =
+                aq.current_units.nitrogen_dioxide.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            print_argos_aqi_line(
+                "NO2",
+                &format!("{:.0}", v),
+                unit,
+                air_quality::nitrogen_dioxide_category(v),
+            );
         }
-        if let Some(v) = aq.current.sulphur_dioxide {
-            println!("SO2: {:.1} μg/m³", v);
+        if show(AqiPollutant::SulphurDioxide)
+            && let Some(v) = aq.current.sulphur_dioxide
+        {
+            let unit =
+                aq.current_units.sulphur_dioxide.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            print_argos_aqi_line(
+                "SO2",
+                &format!("{:.1}", v),
+                unit,
+                air_quality::sulphur_dioxide_category(v),
+            );
         }
-        if let Some(v) = aq.current.carbon_monoxide {
-            println!("CO: {:.0} μg/m³", v);
+        if show(AqiPollutant::CarbonMonoxide)
+            && let Some(v) = aq.current.carbon_monoxide
+        {
+            let unit =
+                aq.current_units.carbon_monoxide.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            print_argos_aqi_line(
+                "CO",
+                &format!("{:.0}", v),
+                unit,
+                air_quality::carbon_monoxide_category(v),
+            );
         }
-        // Dust is hidden on normal days — only show it when something
-        // unusual is happening (Saharan dust transport, sandstorms, etc.)
-        if let Some(v) = aq.current.dust
+        // Hidden when below background — only show during dust events.
+        if show(AqiPollutant::Dust)
+            && let Some(v) = aq.current.dust
             && v > air_quality::DUST_DISPLAY_THRESHOLD
         {
-            println!("Dust: {:.1} μg/m³", v);
+            let unit = aq.current_units.dust.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            print_argos_aqi_line("Dust", &format!("{:.1}", v), unit, air_quality::dust_category(v));
         }
         if let Some(v) = aq.current.aerosol_optical_depth {
-            println!("AOD: {:.2} ({})", v, air_quality::aerosol_optical_depth_category(v));
+            // AOD is dimensionless (Open-Meteo returns an empty unit
+            // string), so empty-unit branch of the helper applies here.
+            print_argos_aqi_line(
+                "AOD",
+                &format!("{:.2}", v),
+                "",
+                air_quality::aerosol_optical_depth_category(v),
+            );
         }
     }
 
@@ -259,9 +369,6 @@ pub fn print_sun_events(
                 transit.format("%H:%M:%S")
             );
 
-            // `find_next_event` now returns Result. The "next event" line is
-            // informational; a real SPA error would already have surfaced in the
-            // main computation above, so we silently ignore it here.
             if let Ok(Some((kind, t))) = calc.find_next_event(date) {
                 println!("Next {} on {} at {}", kind, t.date_naive(), t.format("%H:%M:%S %Z"));
             }
@@ -293,36 +400,85 @@ pub fn print_uv_info(panel_output_label: &str, uv_current: f64, uv_max: f64) {
 /// * `show_aqi` - Whether to render the Air Quality block
 /// * `show_pollen` - Whether to render the Pollen block (skipped when
 ///   no species are above their trace threshold)
-pub fn print_air_quality_terminal(aq: &AirQualityResponse, show_aqi: bool, show_pollen: bool) {
+/// * `aqi_display` - Filter selecting which of the 7 per-pollutant lines
+///   to render (empty = all). `european_aqi` and
+///   `aerosol_optical_depth` are always shown.
+pub fn print_air_quality_terminal(
+    aq: &AirQualityResponse,
+    show_aqi: bool,
+    show_pollen: bool,
+    aqi_display: &[AqiPollutant],
+) {
+    // Empty filter == show everything; otherwise only show what was listed.
+    let show = |p: AqiPollutant| aqi_display.is_empty() || aqi_display.contains(&p);
+
     if show_aqi {
         println!();
         println!("=== Air Quality ===");
         if let Some(eaqi) = aq.current.european_aqi {
             println!("European AQI : {:.0} ({})", eaqi, air_quality::european_aqi_category(eaqi));
         }
-        if let Some(v) = aq.current.pm2_5 {
-            println!("PM2.5        : {:.1} μg/m³", v);
+        if show(AqiPollutant::Pm25)
+            && let Some(v) = aq.current.pm2_5
+        {
+            let unit = aq.current_units.pm2_5.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            println!("PM2.5        : {:.1} {} ({})", v, unit, air_quality::pm25_category(v));
         }
-        if let Some(v) = aq.current.pm10 {
-            println!("PM10         : {:.1} μg/m³", v);
+        if show(AqiPollutant::Pm10)
+            && let Some(v) = aq.current.pm10
+        {
+            let unit = aq.current_units.pm10.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            println!("PM10         : {:.1} {} ({})", v, unit, air_quality::pm10_category(v));
         }
-        if let Some(v) = aq.current.ozone {
-            println!("O3           : {:.0} μg/m³", v);
+        if show(AqiPollutant::Ozone)
+            && let Some(v) = aq.current.ozone
+        {
+            let unit = aq.current_units.ozone.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            println!("O3           : {:.0} {} ({})", v, unit, air_quality::ozone_category(v));
         }
-        if let Some(v) = aq.current.nitrogen_dioxide {
-            println!("NO2          : {:.0} μg/m³", v);
+        if show(AqiPollutant::NitrogenDioxide)
+            && let Some(v) = aq.current.nitrogen_dioxide
+        {
+            let unit =
+                aq.current_units.nitrogen_dioxide.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            println!(
+                "NO2          : {:.0} {} ({})",
+                v,
+                unit,
+                air_quality::nitrogen_dioxide_category(v)
+            );
         }
-        if let Some(v) = aq.current.sulphur_dioxide {
-            println!("SO2          : {:.1} μg/m³", v);
+        if show(AqiPollutant::SulphurDioxide)
+            && let Some(v) = aq.current.sulphur_dioxide
+        {
+            let unit =
+                aq.current_units.sulphur_dioxide.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            println!(
+                "SO2          : {:.1} {} ({})",
+                v,
+                unit,
+                air_quality::sulphur_dioxide_category(v)
+            );
         }
-        if let Some(v) = aq.current.carbon_monoxide {
-            println!("CO           : {:.0} μg/m³", v);
+        if show(AqiPollutant::CarbonMonoxide)
+            && let Some(v) = aq.current.carbon_monoxide
+        {
+            let unit =
+                aq.current_units.carbon_monoxide.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            println!(
+                "CO           : {:.0} {} ({})",
+                v,
+                unit,
+                air_quality::carbon_monoxide_category(v)
+            );
         }
         // Hidden when below background — only show during dust events.
-        if let Some(v) = aq.current.dust
+        if show(AqiPollutant::Dust)
+            && let Some(v) = aq.current.dust
             && v > air_quality::DUST_DISPLAY_THRESHOLD
         {
-            println!("Dust         : {:.1} μg/m³", v);
+            let unit = aq.current_units.dust.as_deref().unwrap_or(DEFAULT_CONCENTRATION_UNIT);
+            println!("Dust         : {:.1} {} ({})", v, unit, air_quality::dust_category(v));
         }
         if let Some(v) = aq.current.aerosol_optical_depth {
             println!(

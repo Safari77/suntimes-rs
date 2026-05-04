@@ -215,6 +215,94 @@ pub fn aerosol_optical_depth_category(value: f64) -> &'static str {
 /// Argos panel from filling with noise on normal days.
 pub const DUST_DISPLAY_THRESHOLD: f64 = 1.0;
 
+// ===================== PER-POLLUTANT CATEGORIES =====================
+
+/// Five-tier severity bands for an individual pollutant.
+///
+/// `thresholds[i]` is the *minimum* concentration (in the pollutant's
+/// native unit) required to enter band `i+1`. Values strictly below
+/// `thresholds[0]` map to "Good"; values ≥ `thresholds[3]` map to
+/// "Very Poor". Non-finite inputs (NaN, ±∞) collapse to "Good".
+struct PollutantBands {
+    thresholds: [f64; 4],
+}
+
+impl PollutantBands {
+    fn category(&self, value: f64) -> &'static str {
+        if !value.is_finite() || value < self.thresholds[0] {
+            "Good"
+        } else if value < self.thresholds[1] {
+            "Fair"
+        } else if value < self.thresholds[2] {
+            "Moderate"
+        } else if value < self.thresholds[3] {
+            "Poor"
+        } else {
+            "Very Poor"
+        }
+    }
+}
+
+// EAQI 1-hour sub-index breakpoints (μg/m³), per
+// https://airindex.eea.europa.eu/AQI/index.html. The EAQI defines six
+// bands (Good, Fair, Moderate, Poor, Very Poor, Extremely Poor); we
+// collapse the top two into a single "Very Poor" tier so all per-pollutant
+// categories share the same five-tier vocabulary as
+// `aerosol_optical_depth_category`.
+const PM25_BANDS: PollutantBands = PollutantBands { thresholds: [10.0, 20.0, 25.0, 50.0] };
+const PM10_BANDS: PollutantBands = PollutantBands { thresholds: [20.0, 40.0, 50.0, 100.0] };
+const NO2_BANDS: PollutantBands = PollutantBands { thresholds: [40.0, 90.0, 120.0, 230.0] };
+const O3_BANDS: PollutantBands = PollutantBands { thresholds: [50.0, 100.0, 130.0, 240.0] };
+const SO2_BANDS: PollutantBands = PollutantBands { thresholds: [100.0, 200.0, 350.0, 500.0] };
+
+// CO has no EAQI sub-index. Bands derived from US EPA 8-hour AQI
+// breakpoints (Good / Moderate / Unhealthy-for-Sensitive-Groups /
+// Unhealthy / Very-Unhealthy+) converted to μg/m³ at standard conditions
+// (1 ppm CO ≈ 1145 μg/m³ at 25 °C / 1013 hPa).
+const CO_BANDS: PollutantBands = PollutantBands { thresholds: [4400.0, 9400.0, 12400.0, 15400.0] };
+
+// Mineral dust has no EAQI sub-index. Bands reflect operational
+// thresholds used in European Saharan-dust monitoring and WMO/MENA
+// dust-storm classifications: tens of μg/m³ during routine intrusions,
+// > 500 μg/m³ in severe storm events.
+const DUST_BANDS: PollutantBands = PollutantBands { thresholds: [50.0, 150.0, 300.0, 500.0] };
+
+/// Five-band category for PM2.5 (μg/m³), EAQI sub-index thresholds.
+pub fn pm25_category(value: f64) -> &'static str {
+    PM25_BANDS.category(value)
+}
+
+/// Five-band category for PM10 (μg/m³), EAQI sub-index thresholds.
+pub fn pm10_category(value: f64) -> &'static str {
+    PM10_BANDS.category(value)
+}
+
+/// Five-band category for NO2 (μg/m³), EAQI sub-index thresholds.
+pub fn nitrogen_dioxide_category(value: f64) -> &'static str {
+    NO2_BANDS.category(value)
+}
+
+/// Five-band category for O3 (μg/m³), EAQI sub-index thresholds.
+pub fn ozone_category(value: f64) -> &'static str {
+    O3_BANDS.category(value)
+}
+
+/// Five-band category for SO2 (μg/m³), EAQI sub-index thresholds.
+pub fn sulphur_dioxide_category(value: f64) -> &'static str {
+    SO2_BANDS.category(value)
+}
+
+/// Five-band category for CO (μg/m³), US EPA AQI 8-hour breakpoints.
+pub fn carbon_monoxide_category(value: f64) -> &'static str {
+    CO_BANDS.category(value)
+}
+
+/// Five-band category for mineral dust (μg/m³), operational dust-storm
+/// thresholds.
+pub fn dust_category(value: f64) -> &'static str {
+    DUST_BANDS.category(value)
+}
+
 // ===================== API RESPONSE =====================
 
 /// Subset of the Open-Meteo air-quality response we care about.
@@ -223,12 +311,43 @@ pub const DUST_DISPLAY_THRESHOLD: f64 = 1.0;
 /// response (in metres above mean sea level) — we use it to back the
 /// `--altitude auto` mode.
 ///
-/// `Option<f64>` everywhere — Open-Meteo omits fields the caller didn't
-/// request, and we make this resilient to missing/null values.
+/// `current_units` carries the unit string that Open-Meteo associates
+/// with each measurement. Display code consumes those verbatim instead
+/// of hard-coding "μg/m³" so the output stays correct if the API ever
+/// returns a different unit (e.g. ppb) for a given field.
+///
+/// `Option<f64>` everywhere on `current` — Open-Meteo omits fields the
+/// caller didn't request, and we make this resilient to missing/null
+/// values. `current_units` defaults to all-None for backward
+/// compatibility with cache files written before this field existed.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AirQualityResponse {
     pub elevation: Option<f64>,
+    #[serde(default)]
+    pub current_units: CurrentUnits,
     pub current: CurrentValues,
+}
+
+/// Per-field unit strings reported by Open-Meteo (e.g. "μg/m³",
+/// "grains/m³", "EAQI", or empty for dimensionless quantities like
+/// aerosol optical depth).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CurrentUnits {
+    pub european_aqi: Option<String>,
+    pub pm10: Option<String>,
+    pub pm2_5: Option<String>,
+    pub nitrogen_dioxide: Option<String>,
+    pub carbon_monoxide: Option<String>,
+    pub ozone: Option<String>,
+    pub sulphur_dioxide: Option<String>,
+    pub dust: Option<String>,
+    pub aerosol_optical_depth: Option<String>,
+    pub alder_pollen: Option<String>,
+    pub birch_pollen: Option<String>,
+    pub grass_pollen: Option<String>,
+    pub mugwort_pollen: Option<String>,
+    pub olive_pollen: Option<String>,
+    pub ragweed_pollen: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -479,6 +598,116 @@ mod tests {
         assert_eq!(aerosol_optical_depth_category(-0.1), "Excellent");
     }
 
+    #[test]
+    fn test_pm25_category_bands() {
+        // EAQI 1-hour PM2.5: <10 Good, <20 Fair, <25 Moderate, <50 Poor, ≥50 Very Poor.
+        assert_eq!(pm25_category(0.0), "Good");
+        assert_eq!(pm25_category(9.9), "Good");
+        assert_eq!(pm25_category(10.0), "Fair");
+        assert_eq!(pm25_category(19.9), "Fair");
+        assert_eq!(pm25_category(20.0), "Moderate");
+        assert_eq!(pm25_category(24.9), "Moderate");
+        assert_eq!(pm25_category(25.0), "Poor");
+        assert_eq!(pm25_category(49.9), "Poor");
+        assert_eq!(pm25_category(50.0), "Very Poor");
+        assert_eq!(pm25_category(500.0), "Very Poor");
+        // Non-finite / negative degrade to "Good".
+        assert_eq!(pm25_category(f64::NAN), "Good");
+        assert_eq!(pm25_category(-1.0), "Good");
+    }
+
+    #[test]
+    fn test_pm10_category_bands() {
+        // EAQI 1-hour PM10: <20 Good, <40 Fair, <50 Moderate, <100 Poor, ≥100 Very Poor.
+        assert_eq!(pm10_category(0.0), "Good");
+        assert_eq!(pm10_category(20.0), "Fair");
+        assert_eq!(pm10_category(40.0), "Moderate");
+        assert_eq!(pm10_category(50.0), "Poor");
+        assert_eq!(pm10_category(100.0), "Very Poor");
+        assert_eq!(pm10_category(500.0), "Very Poor");
+    }
+
+    #[test]
+    fn test_nitrogen_dioxide_category_bands() {
+        // EAQI 1-hour NO2: <40, <90, <120, <230.
+        assert_eq!(nitrogen_dioxide_category(0.0), "Good");
+        assert_eq!(nitrogen_dioxide_category(40.0), "Fair");
+        assert_eq!(nitrogen_dioxide_category(90.0), "Moderate");
+        assert_eq!(nitrogen_dioxide_category(120.0), "Poor");
+        assert_eq!(nitrogen_dioxide_category(230.0), "Very Poor");
+    }
+
+    #[test]
+    fn test_ozone_category_bands() {
+        // EAQI 1-hour O3: <50, <100, <130, <240.
+        assert_eq!(ozone_category(0.0), "Good");
+        assert_eq!(ozone_category(50.0), "Fair");
+        assert_eq!(ozone_category(100.0), "Moderate");
+        assert_eq!(ozone_category(130.0), "Poor");
+        assert_eq!(ozone_category(240.0), "Very Poor");
+        assert_eq!(ozone_category(67.0), "Fair");
+    }
+
+    #[test]
+    fn test_sulphur_dioxide_category_bands() {
+        // EAQI 1-hour SO2: <100, <200, <350, <500.
+        assert_eq!(sulphur_dioxide_category(0.0), "Good");
+        assert_eq!(sulphur_dioxide_category(100.0), "Fair");
+        assert_eq!(sulphur_dioxide_category(200.0), "Moderate");
+        assert_eq!(sulphur_dioxide_category(350.0), "Poor");
+        assert_eq!(sulphur_dioxide_category(500.0), "Very Poor");
+    }
+
+    #[test]
+    fn test_carbon_monoxide_category_bands() {
+        // US EPA AQI 8-hour CO breakpoints, μg/m³.
+        assert_eq!(carbon_monoxide_category(0.0), "Good");
+        assert_eq!(carbon_monoxide_category(147.0), "Good");
+        assert_eq!(carbon_monoxide_category(4400.0), "Fair");
+        assert_eq!(carbon_monoxide_category(9400.0), "Moderate");
+        assert_eq!(carbon_monoxide_category(12400.0), "Poor");
+        assert_eq!(carbon_monoxide_category(15400.0), "Very Poor");
+    }
+
+    #[test]
+    fn test_dust_category_bands() {
+        // Operational dust-storm thresholds.
+        assert_eq!(dust_category(0.0), "Good");
+        assert_eq!(dust_category(50.0), "Fair");
+        assert_eq!(dust_category(150.0), "Moderate");
+        assert_eq!(dust_category(300.0), "Poor");
+        assert_eq!(dust_category(500.0), "Very Poor");
+    }
+
+    #[test]
+    fn test_current_units_default_when_missing() {
+        // Backward compat: cache files written before current_units was
+        // added should still deserialize cleanly.
+        let json = r#"{"elevation": 18.0, "current": {"european_aqi": 27}}"#;
+        let parsed: AirQualityResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.elevation, Some(18.0));
+        assert!(parsed.current_units.pm2_5.is_none());
+        assert!(parsed.current_units.european_aqi.is_none());
+    }
+
+    #[test]
+    fn test_current_units_parsed_when_present() {
+        let json = r#"{
+            "elevation": 11.0,
+            "current_units": {
+                "european_aqi": "EAQI",
+                "pm2_5": "μg/m³",
+                "aerosol_optical_depth": ""
+            },
+            "current": {"european_aqi": 27, "pm2_5": 2.6}
+        }"#;
+        let parsed: AirQualityResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.current_units.european_aqi.as_deref(), Some("EAQI"));
+        assert_eq!(parsed.current_units.pm2_5.as_deref(), Some("μg/m³"));
+        // Empty unit string is preserved (AOD is dimensionless in the API).
+        assert_eq!(parsed.current_units.aerosol_optical_depth.as_deref(), Some(""));
+    }
+
     fn species(name: &str) -> &'static PollenSpecies {
         POLLEN_SPECIES.iter().find(|s| s.api_key == name).expect("species in table")
     }
@@ -505,7 +734,6 @@ mod tests {
         assert_eq!(s.classify(101.0), Some(PollenSeverity::High));
         assert_eq!(s.classify(1000.0), Some(PollenSeverity::High));
         assert_eq!(s.classify(1001.0), Some(PollenSeverity::VeryHigh));
-        // Sample value from the user's example response (2533.2 grains/m³).
         assert_eq!(s.classify(2533.2), Some(PollenSeverity::VeryHigh));
     }
 
