@@ -164,6 +164,9 @@ fn print_argos_air_quality(aq: &AirQualityResponse, show_aqi: bool, show_pollen:
         if let Some(v) = aq.current.sulphur_dioxide {
             println!("SO2: {:.1} μg/m³", v);
         }
+        if let Some(v) = aq.current.carbon_monoxide {
+            println!("CO: {:.0} μg/m³", v);
+        }
         // Dust is hidden on normal days — only show it when something
         // unusual is happening (Saharan dust transport, sandstorms, etc.)
         if let Some(v) = aq.current.dust
@@ -311,6 +314,9 @@ pub fn print_air_quality_terminal(aq: &AirQualityResponse, show_aqi: bool, show_
         }
         if let Some(v) = aq.current.sulphur_dioxide {
             println!("SO2          : {:.1} μg/m³", v);
+        }
+        if let Some(v) = aq.current.carbon_monoxide {
+            println!("CO           : {:.0} μg/m³", v);
         }
         // Hidden when below background — only show during dust events.
         if let Some(v) = aq.current.dust

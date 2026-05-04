@@ -49,8 +49,8 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// AQI fields (queried on every fetch).
 ///
 /// `european_aqi` is the overall European AQI index.
-/// `sulphur_dioxide`, `pm10`, `pm2_5`, `nitrogen_dioxide`, `ozone`, and
-/// `dust` are raw concentrations in μg/m³.
+/// `sulphur_dioxide`, `pm10`, `pm2_5`, `nitrogen_dioxide`, `carbon_monoxide`,
+/// `ozone`, and `dust` are raw concentrations in μg/m³.
 /// `aerosol_optical_depth` is dimensionless (column extinction at
 /// 550 nm); we map it to a descriptive category for display.
 const AQI_FIELDS: &[&str] = &[
@@ -58,6 +58,7 @@ const AQI_FIELDS: &[&str] = &[
     "pm10",
     "pm2_5",
     "nitrogen_dioxide",
+    "carbon_monoxide",
     "ozone",
     "sulphur_dioxide",
     "dust",
@@ -236,6 +237,7 @@ pub struct CurrentValues {
     pub pm10: Option<f64>,
     pub pm2_5: Option<f64>,
     pub nitrogen_dioxide: Option<f64>,
+    pub carbon_monoxide: Option<f64>,
     pub ozone: Option<f64>,
     pub sulphur_dioxide: Option<f64>,
     pub dust: Option<f64>,
