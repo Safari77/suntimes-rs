@@ -247,6 +247,30 @@ pub struct Args {
     #[arg(long, env = "ARGOS_SUNTIMES_ONLINE_AOD")]
     pub online_aod: bool,
 
+    /// Ångström exponent (α) used to scale aerosol optical depth from the
+    /// 550 nm value to the 310 nm UV band when --online-aod is active (and
+    /// for the formula model's background AOD). It encodes aerosol particle
+    /// size: higher α = finer particles = AOD rises more steeply toward the
+    /// UV = stronger UV suppression. Pick the value matching the dominant
+    /// aerosol over your location:
+    ///   0.0-0.5  Desert dust / sand / volcanic ash (coarse). Saharan,
+    ///            Arabian, Gobi outbreaks and arid downwind regions. Flat
+    ///            spectrum: UV-band AOD barely above the 550 nm value.
+    ///   0.5-1.0  Maritime / sea-salt, clean coastal and open-ocean air,
+    ///            dust+pollution mixtures.
+    ///   1.0-1.5  Continental background / mixed rural aerosol. The 1.3
+    ///            default lives here: a safe all-purpose temperate value.
+    ///   1.5-2.5  Fine-mode pollution: urban/industrial haze, sulphates,
+    ///            and fresh biomass-burning / wildfire smoke (incl. boreal
+    ///            smoke transported into the Nordics). Steep spectrum:
+    ///            UV-band AOD far exceeds the 550 nm value.
+    /// A single α assumes a power-law spectrum; 550->310 nm is a long
+    /// extrapolation, so treat this as a first-order correction. Ignored
+    /// unless a 550 nm AOD is actually being converted (the offline grid is
+    /// already stored at 310 nm).
+    #[arg(long, default_value_t = 1.3, value_parser = parse_angstrom, env = "ARGOS_SUNTIMES_ANGSTROM_EXPONENT")]
+    pub angstrom_exponent: f64,
+
     /// Show build info from Cargo.lock at time of building
     #[arg(long)]
     pub show_build_info: bool,
@@ -421,6 +445,16 @@ fn parse_albedo(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
     if !(0.0..=1.0).contains(&v) {
         return Err(format!("Albedo must be between 0.0 and 1.0, got {}", v));
+    }
+    Ok(v)
+}
+
+fn parse_angstrom(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
+    // 0.0 (flat/coarse dust spectrum) to 3.0 (very fine fresh smoke) spans
+    // the physically meaningful range for the 550->310 nm UV extrapolation.
+    if !(0.0..=3.0).contains(&v) {
+        return Err(format!("Ångström exponent must be between 0.0 and 3.0, got {}", v));
     }
     Ok(v)
 }

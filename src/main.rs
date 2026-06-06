@@ -348,6 +348,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             month,
             altitude,
             online_aod_550,
+            args.angstrom_exponent,
         )
     } else {
         uv::calculate_uv_index(
@@ -357,6 +358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.longitude.value,
             altitude,
             online_aod_550,
+            args.angstrom_exponent,
         )
     };
 
@@ -368,6 +370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             month,
             altitude,
             online_aod_550,
+            args.angstrom_exponent,
         )
     } else {
         uv::calculate_uv_index(
@@ -377,6 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.longitude.value,
             altitude,
             online_aod_550,
+            args.angstrom_exponent,
         )
     };
 

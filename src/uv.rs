@@ -256,6 +256,7 @@ pub fn calculate_uv_index(
     lon: f64,
     altitude_m: f64,
     online_aod_550: Option<f64>,
+    angstrom_exponent: f64,
 ) -> f64 {
     if solar_elevation <= 0.0 {
         return 0.0;
@@ -272,12 +273,13 @@ pub fn calculate_uv_index(
     const AEROSOL_SCALE_HEIGHT_KM: f64 = 1.5;
     // AOD source at the 310 nm UV band. The offline grid already stores
     // 310 nm; the online air-quality value is a 550 nm total-column AOD
-    // (CAMS, see air_quality.rs), so convert it with the same Ångström
-    // relation the formula model uses. Either way it is a *column* value,
-    // so the scale-height term below thins it for the observer's altitude.
+    // (CAMS, see air_quality.rs), so convert it to 310 nm via the Ångström
+    // relation using the caller-supplied exponent (--angstrom-exponent).
+    // Either way it is a *column* value, so the scale-height term below
+    // thins it for the observer's altitude.
     let aod_310 = match online_aod_550 {
         Some(aod550) if aod550.is_finite() && aod550 >= 0.0 => {
-            angstrom_aod(aod550, 550.0, 310.0, 1.3)
+            angstrom_aod(aod550, 550.0, 310.0, angstrom_exponent)
         }
         _ => cell.aod_310 as f64,
     };
@@ -306,6 +308,7 @@ pub fn calculate_uv_index_formula(
     month: u32,
     altitude_m: f64,
     online_aod_550: Option<f64>,
+    angstrom_exponent: f64,
 ) -> f64 {
     if solar_elevation <= 0.0 {
         return 0.0;
@@ -333,13 +336,14 @@ pub fn calculate_uv_index_formula(
     const AEROSOL_SCALE_HEIGHT_KM: f64 = 1.5;
     // 550 nm column AOD: prefer the online air-quality value when supplied,
     // otherwise fall back to the 0.15 climatological background. Converted
-    // to the 310 nm UV band via the Ångström relation, then thinned for
+    // to the 310 nm UV band via the Ångström relation using the
+    // caller-supplied exponent (--angstrom-exponent), then thinned for
     // altitude by the scale-height term below.
     let aod550 = match online_aod_550 {
         Some(v) if v.is_finite() && v >= 0.0 => v,
         _ => 0.15,
     };
-    let aod_uv_sea_level = angstrom_aod(aod550, 550.0, 310.0, 1.3);
+    let aod_uv_sea_level = angstrom_aod(aod550, 550.0, 310.0, angstrom_exponent);
     let aod_uv = aod_uv_sea_level * (-altitude_km / AEROSOL_SCALE_HEIGHT_KM).exp();
     let m_aerosol = aerosol_airmass(solar_elevation);
     let aerosol_trans = (-0.5 * aod_uv * m_aerosol).exp();
@@ -377,26 +381,26 @@ mod tests {
     fn test_uvi_benchmarks() {
         // Benchmark 1: Tropical Noon (Zenith sun, high GHI, low airmass, low ozone)
         // Result should be "Extreme" (11+)
-        let uvi_tropics = calculate_uv_index_formula(90.0, 0.0, 3, 0.0, None);
+        let uvi_tropics = calculate_uv_index_formula(90.0, 0.0, 3, 0.0, None, 1.3);
         assert!(uvi_tropics > 11.0, "Tropical noon UVI should be extreme, got {}", uvi_tropics);
 
         // Benchmark 2: Mid-latitude Summer Noon (45N, ~68 elev, June/Month 6)
         // Result should be "Very High" (8-10)
-        let uvi_summer = calculate_uv_index_formula(68.0, 45.0, 6, 0.0, None);
+        let uvi_summer = calculate_uv_index_formula(68.0, 45.0, 6, 0.0, None, 1.3);
         assert!(uvi_summer > 7.0 && uvi_summer < 11.0, "Summer UVI {} out of range", uvi_summer);
 
         // Benchmark 3: Mid-latitude Winter Noon (45N, ~22 elev, Dec/Month 12)
         // Result should be "Low" (< 2)
-        let uvi_winter = calculate_uv_index_formula(22.0, 45.0, 12, 0.0, None);
+        let uvi_winter = calculate_uv_index_formula(22.0, 45.0, 12, 0.0, None, 1.3);
         assert!(uvi_winter < 2.0, "Winter UVI {} must be low (< 2.0)", uvi_winter);
     }
 
     #[test]
     fn test_stratospheric_uv_resilience() {
         // Sea level: Month 6, altitude 0m
-        let uvi_sea = calculate_uv_index_formula(60.0, 45.0, 6, 0.0, None);
+        let uvi_sea = calculate_uv_index_formula(60.0, 45.0, 6, 0.0, None, 1.3);
         // Stratosphere (11km): Less ozone above city
-        let uvi_11km = calculate_uv_index_formula(60.0, 45.0, 6, 11000.0, None);
+        let uvi_11km = calculate_uv_index_formula(60.0, 45.0, 6, 11000.0, None, 1.3);
 
         assert!(
             uvi_11km > uvi_sea * 1.5,
@@ -413,7 +417,7 @@ mod tests {
         let month = 6;
         let sun_elevation = 46.0;
 
-        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 200.0, None);
+        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 200.0, None, 1.3);
 
         // Expected: Moderate (3-6)
         assert!(uvi >= 3.0 && uvi <= 6.0, "Lapland summer UVI {} should be moderate", uvi);
@@ -426,7 +430,7 @@ mod tests {
         let month = 3;
         let sun_elevation = 90.0;
 
-        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 2850.0, None);
+        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 2850.0, None, 1.3);
 
         // Quito has extreme UV (>14) due to low ozone and altitude correction
         assert!(uvi > 14.0, "Quito equinox UVI {} should be extreme (>14)", uvi);
@@ -439,7 +443,7 @@ mod tests {
         let month = 1;
         let sun_elevation = 81.5;
 
-        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 30.0, None);
+        let uvi = calculate_uv_index_formula(sun_elevation, latitude, month, 30.0, None, 1.3);
 
         // Australian summer UVI is notoriously extreme (11+)
         assert!(uvi >= 11.0, "Australian summer UVI {} should be extreme (>=11)", uvi);
@@ -447,8 +451,8 @@ mod tests {
 
     #[test]
     fn test_zero_uvi_at_night() {
-        assert_eq!(calculate_uv_index_formula(-5.0, 10.0, 6, 0.0, None), 0.0);
-        assert_eq!(calculate_uv_index_formula(0.0, 40.0, 6, 0.0, None), 0.0);
+        assert_eq!(calculate_uv_index_formula(-5.0, 10.0, 6, 0.0, None, 1.3), 0.0);
+        assert_eq!(calculate_uv_index_formula(0.0, 40.0, 6, 0.0, None, 1.3), 0.0);
     }
 
     #[test]
@@ -476,7 +480,7 @@ mod tests {
     #[test]
     fn test_blob_zero_uvi_at_night() {
         // Sun below horizon should always safely short-circuit to 0.0[cite: 2]
-        let uvi = calculate_uv_index(-5.0, 180, 60.2, 25.3, 50.0, None);
+        let uvi = calculate_uv_index(-5.0, 180, 60.2, 25.3, 50.0, None, 1.3);
         assert_eq!(uvi, 0.0, "Nighttime UV must be exactly 0.0");
     }
 
@@ -485,7 +489,7 @@ mod tests {
         // Location: Altiplano, Andes Mountains (near Equator/Peru)
         // Extreme altitude (~4000m), overhead sun (90°).
         // This is consistently one of the highest UV areas on Earth.
-        let uvi = calculate_uv_index(90.0, 355, -15.0, -70.0, 4000.0, None);
+        let uvi = calculate_uv_index(90.0, 355, -15.0, -70.0, 4000.0, None, 1.3);
 
         assert!(uvi > 15.0, "Andes extreme altitude UVI ({}) should be > 14.0", uvi);
     }
@@ -499,8 +503,8 @@ mod tests {
         let day = 200; // Mid-summer
         let sun_elev = 50.0;
 
-        let uvi_sea_level = calculate_uv_index(sun_elev, day, lat, lon, 0.0, None);
-        let uvi_11km = calculate_uv_index(sun_elev, day, lat, lon, 11000.0, None);
+        let uvi_sea_level = calculate_uv_index(sun_elev, day, lat, lon, 0.0, None, 1.3);
+        let uvi_11km = calculate_uv_index(sun_elev, day, lat, lon, 11000.0, None, 1.3);
 
         assert!(
             uvi_11km > uvi_sea_level * 2.0,
@@ -513,7 +517,7 @@ mod tests {
     #[test]
     fn test_blob_sipoo_summer_baseline() {
         // Baseline sanity check for Southern Finland using typical August data
-        let uvi = calculate_uv_index(45.0, 225, 60.0, 25.0, 50.0, None);
+        let uvi = calculate_uv_index(45.0, 225, 60.0, 25.0, 50.0, None, 1.3);
 
         // At 45 deg sun elevation, UV should be moderate (typically 3.0 to 5.0)
         assert!(
@@ -529,7 +533,7 @@ mod tests {
         // Time: Late October (Day 295), which is peak ozone hole season.
         // Even with a low sun angle (30°), the missing ozone + snow albedo
         // causes surprisingly dangerous UV levels.
-        let uvi = calculate_uv_index(30.0, 295, -75.5, -26.6, 30.0, None);
+        let uvi = calculate_uv_index(30.0, 295, -75.5, -26.6, 30.0, None, 1.3);
 
         // If this was a normal mid-latitude with a 30° sun, UV would be ~1.5.
         // Because of the ozone hole and snow, it should be significantly higher.
