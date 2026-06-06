@@ -236,6 +236,17 @@ pub struct Args {
     #[arg(long)]
     pub formula_calcs: bool,
 
+    /// Use the online aerosol optical depth (the 550 nm column value fetched
+    /// alongside air quality) when estimating the UV Index, instead of the
+    /// offline aerosol climatology. Takes effect ONLY when --aqi is also set,
+    /// since --aqi is what performs the online fetch. This flag does NOT by
+    /// itself trigger a network fetch and never enables ARGOS_SUNTIMES_AQI —
+    /// --aqi must be set manually. Kept separate so the fetched column AOD
+    /// can be reused while varying --altitude to estimate UV at different
+    /// elevations.
+    #[arg(long, env = "ARGOS_SUNTIMES_ONLINE_AOD")]
+    pub online_aod: bool,
+
     /// Show build info from Cargo.lock at time of building
     #[arg(long)]
     pub show_build_info: bool,

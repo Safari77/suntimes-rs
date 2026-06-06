@@ -327,12 +327,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Current UV (at target time)
     let month = date.month();
 
+    // Online aerosol optical depth feed for the UV calculation. The fetched
+    // value is a 550 nm total-column AOD (CAMS, via --aqi); uv.rs converts it
+    // to the 310 nm UV band and applies its own altitude scale-height
+    // correction, so it is reused as-is across different --altitude values.
+    // Gated on --aqi specifically (not the broader fetch trigger) because
+    // --aqi is the documented switch for online air-quality data, and on
+    // --online-aod as the explicit opt-in. Missing/None AOD falls back to the
+    // offline climatology inside uv.rs.
+    let online_aod_550: Option<f64> = if args.aqi && args.online_aod {
+        air_quality.as_ref().and_then(|aq| aq.current.aerosol_optical_depth)
+    } else {
+        None
+    };
+
     let uv_current = if args.formula_calcs {
         uv::calculate_uv_index_formula(
             panel_output_pos.elevation_angle(),
             args.latitude.value,
             month,
             altitude,
+            online_aod_550,
         )
     } else {
         uv::calculate_uv_index(
@@ -341,6 +356,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.latitude.value,
             args.longitude.value,
             altitude,
+            online_aod_550,
         )
     };
 
@@ -351,6 +367,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.latitude.value,
             month,
             altitude,
+            online_aod_550,
         )
     } else {
         uv::calculate_uv_index(
@@ -359,6 +376,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             args.latitude.value,
             args.longitude.value,
             altitude,
+            online_aod_550,
         )
     };
 
