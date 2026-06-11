@@ -326,21 +326,24 @@ pub struct Args {
     pub solarpanel_dual_axis: bool,
 
     /// Enable horizontal single-axis tracking (HSAT)
-    /// Axis runs N-S, panel rotates E-W to track sun's azimuth
-    /// Tilt stays fixed (use --solarpanel-tilt or --solarpanel-find-optimum)
+    /// Panel rotates about an axis along the meridian to track the sun E-W;
+    /// surface tilt and azimuth both follow the rotation.
+    /// --solarpanel-tilt sets the axis tilt (0 = classic horizontal N-S axis,
+    /// or use --solarpanel-find-optimum) and --solarpanel-azimuth the
+    /// rest-position facing
     #[arg(long, conflicts_with_all = ["solarpanel_dual_axis", "solarpanel_vertical_tracking"])]
     pub solarpanel_horizontal_tracking: bool,
 
     /// Enable vertical single-axis tracking (VSAT)
-    /// Axis is vertical, panel tilts to track sun's altitude
-    /// Azimuth stays fixed (use --solarpanel-azimuth or --solarpanel-find-optimum)
+    /// Axis is vertical, panel rotates to track the sun's azimuth
+    /// Tilt stays fixed (use --solarpanel-tilt or --solarpanel-find-optimum)
     #[arg(long, conflicts_with_all = ["solarpanel_dual_axis", "solarpanel_horizontal_tracking"])]
     pub solarpanel_vertical_tracking: bool,
 
     /// Find optimum panel configuration for maximum daily energy
     /// - Fixed panel: finds optimal tilt and azimuth
-    /// - HSAT: finds optimal tilt (azimuth is tracked)
-    /// - VSAT: finds optimal azimuth (tilt is tracked)
+    /// - HSAT: finds optimal axis tilt (sun is tracked by the rotation)
+    /// - VSAT: finds optimal tilt (azimuth is tracked)
     ///   Not compatible with dual-axis tracking
     #[arg(long, conflicts_with = "solarpanel_dual_axis")]
     pub solarpanel_find_optimum: bool,
@@ -358,8 +361,9 @@ pub struct Args {
     pub solarpanel_tilt_range: Option<(f64, f64)>,
 
     /// Azimuth range constraint: "MIN-MAX" (e.g., "150-210" limits azimuth to 150°-210°)
+    /// MIN > MAX wraps through north (e.g., "300-60" allows NW through NE)
     /// If not specified, full range 0-360 is used
-    #[arg(long, value_parser = parse_range, env = "ARGOS_SUNTIMES_SOLARPANEL_AZIMUTH_RANGE")]
+    #[arg(long, value_parser = parse_azimuth_range, env = "ARGOS_SUNTIMES_SOLARPANEL_AZIMUTH_RANGE")]
     pub solarpanel_azimuth_range: Option<(f64, f64)>,
 }
 
@@ -480,6 +484,24 @@ fn parse_range(s: &str) -> Result<(f64, f64), String> {
     Ok((min, max))
 }
 
+/// Like parse_range, but MIN > MAX is allowed: an azimuth range such as
+/// "300-60" wraps through north (NW through NE). The optimizer constraints
+/// understand this wraparound convention.
+fn parse_azimuth_range(s: &str) -> Result<(f64, f64), String> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 2 {
+        return Err(format!("Range must be in format MIN-MAX (e.g., '150-210'), got '{}'", s));
+    }
+    let min: f64 = parts[0].parse().map_err(|_| format!("Invalid minimum value: {}", parts[0]))?;
+    let max: f64 = parts[1].parse().map_err(|_| format!("Invalid maximum value: {}", parts[1]))?;
+    for v in [min, max] {
+        if !(0.0..=360.0).contains(&v) {
+            return Err(format!("Azimuth must be between 0 and 360 degrees, got {}", v));
+        }
+    }
+    Ok((min, max))
+}
+
 // ===================== TESTS =====================
 
 #[cfg(test)]
@@ -570,5 +592,24 @@ mod tests {
         assert!(parse_latitude("91").is_err());
         assert!(parse_latitude("-91").is_err());
         assert!(parse_latitude("not a number").is_err());
+    }
+
+    #[test]
+    fn test_parse_range_requires_order() {
+        assert_eq!(parse_range("20-60").unwrap(), (20.0, 60.0));
+        // Tilt has no wraparound semantics, inverted input is a user error
+        assert!(parse_range("60-20").is_err());
+        assert!(parse_range("20").is_err());
+        assert!(parse_range("a-b").is_err());
+    }
+
+    #[test]
+    fn test_parse_azimuth_range_allows_wraparound() {
+        assert_eq!(parse_azimuth_range("150-210").unwrap(), (150.0, 210.0));
+        // MIN > MAX wraps through north (NW through NE)
+        assert_eq!(parse_azimuth_range("300-60").unwrap(), (300.0, 60.0));
+        // But values must still be valid azimuths
+        assert!(parse_azimuth_range("300-400").is_err());
+        assert!(parse_azimuth_range("-10-60").is_err());
     }
 }

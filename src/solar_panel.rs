@@ -33,13 +33,16 @@ pub enum TrackingMode {
     #[default]
     Fixed,
     /// Horizontal single-axis tracking (HSAT)
-    /// Axis runs N-S, panel rotates E-W to track sun's azimuth
-    /// Tilt is fixed (set via --solarpanel-tilt, can be optimized)
+    /// Panel rotates about an axis lying along a meridian to track the sun E-W;
+    /// surface tilt and azimuth both vary with the rotation angle.
+    /// The axis itself may be tilted: axis tilt is set via --solarpanel-tilt
+    /// (0 = classic horizontal N-S axis, can be optimized) and the axis leans
+    /// so the rest-position panel faces --solarpanel-azimuth.
     /// Most common for utility-scale installations
     HorizontalAxis,
     /// Vertical single-axis tracking (VSAT)
-    /// Axis is vertical, panel tilts to track sun's altitude
-    /// Azimuth is fixed (set via --solarpanel-azimuth)
+    /// Axis is vertical, panel azimuth rotates to track the sun's azimuth
+    /// Tilt is fixed (set via --solarpanel-tilt, can be optimized)
     VerticalAxis,
     /// Dual-axis tracking - panel always faces the sun directly (both tilt and azimuth)
     /// Provides +30-40% energy vs fixed, highest cost and maintenance
@@ -169,6 +172,63 @@ pub fn angle_of_incidence(
     cos_aoi.clamp(-1.0, 1.0).acos().to_degrees()
 }
 
+/// Compute panel orientation for a single-axis tracker (HSAT family)
+///
+/// The rotation axis lies along the meridian of `lean_azimuth_deg` and is
+/// raised from horizontal by `axis_tilt_deg`, leaning so that the panel's
+/// rest position faces `lean_azimuth_deg`. The panel rotates about this axis
+/// (rotation limited to ±90°) to minimize the angle of incidence.
+/// With axis_tilt = 0 this is a classic horizontal N-S axis tracker.
+///
+/// # Arguments
+/// * `sun_elevation_deg` - Sun elevation in degrees
+/// * `sun_azimuth_deg` - Sun azimuth in degrees (0 = North, 90 = East)
+/// * `axis_tilt_deg` - Axis tilt from horizontal in degrees (clamped to 0-89)
+/// * `lean_azimuth_deg` - Direction the rest-position panel faces in degrees
+///
+/// # Returns
+/// (surface_tilt_deg, surface_azimuth_deg) of the rotated panel
+pub fn single_axis_tracker_orientation(
+    sun_elevation_deg: f64,
+    sun_azimuth_deg: f64,
+    axis_tilt_deg: f64,
+    lean_azimuth_deg: f64,
+) -> (f64, f64) {
+    // An exactly vertical axis would be a VSAT; keep the rest-normal well defined
+    let tau = axis_tilt_deg.clamp(0.0, 89.0).to_radians();
+    let lean = lean_azimuth_deg.to_radians();
+    let alpha = sun_elevation_deg.to_radians();
+    let sun_az = sun_azimuth_deg.to_radians();
+
+    // ENU coordinates: x = East, y = North, z = Up
+    let s = [alpha.cos() * sun_az.sin(), alpha.cos() * sun_az.cos(), alpha.sin()];
+    // The axis rises toward the direction opposite the lean azimuth, which
+    // makes the rest-position normal lean toward lean_azimuth_deg
+    let a = [-tau.cos() * lean.sin(), -tau.cos() * lean.cos(), tau.sin()];
+
+    // Rest-position normal: vertical projected perpendicular to the axis
+    let za = a[2]; // z·a
+    let n0_raw = [-za * a[0], -za * a[1], 1.0 - za * a[2]];
+    let n0_len = (n0_raw[0] * n0_raw[0] + n0_raw[1] * n0_raw[1] + n0_raw[2] * n0_raw[2]).sqrt();
+    let n0 = [n0_raw[0] / n0_len, n0_raw[1] / n0_len, n0_raw[2] / n0_len];
+
+    // p = a × n0, the rotation direction perpendicular to axis and rest normal
+    let p = [a[1] * n0[2] - a[2] * n0[1], a[2] * n0[0] - a[0] * n0[2], a[0] * n0[1] - a[1] * n0[0]];
+
+    // Rotation angle maximizing cos(AOI) = s·n(R), limited to ±90°
+    let s_n0 = s[0] * n0[0] + s[1] * n0[1] + s[2] * n0[2];
+    let s_p = s[0] * p[0] + s[1] * p[1] + s[2] * p[2];
+    let r = s_p.atan2(s_n0).clamp(-PI / 2.0, PI / 2.0);
+
+    let (sin_r, cos_r) = r.sin_cos();
+    let n =
+        [n0[0] * cos_r + p[0] * sin_r, n0[1] * cos_r + p[1] * sin_r, n0[2] * cos_r + p[2] * sin_r];
+
+    let surface_tilt = n[2].clamp(-1.0, 1.0).acos().to_degrees();
+    let surface_azimuth = n[0].atan2(n[1]).to_degrees().rem_euclid(360.0);
+    (surface_tilt, surface_azimuth)
+}
+
 // ===================== ATMOSPHERIC CALCULATIONS =====================
 
 /// Calculate absolute air mass (pressure-corrected)
@@ -192,13 +252,10 @@ pub fn air_mass(sun_elevation_deg: f64, altitude_m: f64) -> f64 {
     // PVLib uses this standard barometric formula:
     // P = P0 * (1 - L*h/T0)^(g*M / R*L)
     // For Earth: (1 - 2.25577e-5 * h)^5.25588
-    let pressure_ratio = if altitude_m.abs() < 1e-5 {
-        1.0
-    } else {
-        // Valid for troposphere (< 11km)
-        // If user puts >11km, this formula drifts, but pvlib does the same.
-        (1.0 - 2.25577e-5 * altitude_m).powf(5.25588)
-    };
+    // Altitude is clamped to the troposphere range where the formula is valid;
+    // beyond ~44 km the base goes negative and powf would return NaN.
+    let h = altitude_m.clamp(-500.0, 11000.0);
+    let pressure_ratio = (1.0 - 2.25577e-5 * h).powf(5.25588);
 
     am_relative * pressure_ratio
 }
@@ -233,8 +290,12 @@ pub fn extraterrestrial_irradiance(day_of_year: u32) -> f64 {
 /// air mass and Linke turbidity coefficient.
 ///
 /// References:
+/// - Ineichen, P. and Perez, R. (2002). "A new airmass independent formulation
+///   for the Linke turbidity coefficient" (GHI and DNI formulations)
 /// - Ineichen, P. (2008). "A broadband simplified version of the Solis clear sky model"
-/// - Rigollier et al. (2000) for the diffuse fraction estimation
+///
+/// DHI is derived as the remainder GHI - DNI·sin(elevation), so the three
+/// components are always physically consistent.
 ///
 /// # Arguments
 /// * `sun_elevation_deg` - Sun elevation in degrees
@@ -278,32 +339,39 @@ pub fn ineichen_perez_clearsky(
     let cg1 = 5.09e-5 * clamped_alt + 0.868;
     let cg2 = 3.92e-5 * clamped_alt + 0.0387;
 
-    // 1. Direct Normal Irradiance (DNI)
+    // 1. Global Horizontal Irradiance (GHI)
+    // The exp(0.01·AM^1.8) factor is the low-sun enhancement term used in
+    // pvlib's implementation of the Ineichen model. GHI is capped at the
+    // extraterrestrial horizontal irradiance for physical sanity (the
+    // enhancement term diverges as AM grows near the horizon).
+    let ghi_exponent = -cg2 * am * (fh1 + fh2 * (tl - 1.0));
+    let enhancement = (0.01 * am.powf(1.8)).exp();
+    let ghi = (cg1 * i0 * sin_elev * ghi_exponent.exp() * enhancement).clamp(0.0, i0 * sin_elev);
+
+    // 2. Direct Normal Irradiance (DNI), Ineichen (2002) formulation:
+    // DNI = b · I0 · exp(-0.09 · AM · (TL - 1))
+    // Note: this deliberately differs from the GHI attenuation exponent.
+    // Reusing the GHI exponent for DNI makes DNI·sin(h) ≈ GHI and collapses
+    // the diffuse component to zero.
     let b = 0.664 + 0.163 / fh1;
-    let dni_coefficient = b * i0;
-    let exponent = -cg2 * am * (fh1 + fh2 * (tl - 1.0));
-    let dni = (dni_coefficient * exponent.exp()).max(0.0).min(i0);
+    let dni_raw = b * i0 * (-0.09 * am * (tl - 1.0)).exp();
+    // The beam cannot exceed extraterrestrial irradiance, nor can its
+    // horizontal projection exceed GHI; the latter cap guarantees DHI >= 0
+    let dni = dni_raw.min(i0).min(ghi / sin_elev.max(1e-9));
 
-    // 2. Global Horizontal Irradiance (GHI)
-    let ghi_exponent = -cg2 * am * (fh1 + fh2 * (tl - 1.0)) * 1.1;
-    let ghi_raw = (cg1 * i0 * sin_elev * ghi_exponent.exp()).max(0.0);
+    // 3. DHI is the remainder of the light after accounting for the direct beam,
+    // so GHI = DNI·sin(h) + DHI holds by construction
+    let dhi = (ghi - dni * sin_elev).max(0.0);
 
-    // 3. Physical Consistency Check
-    // GHI cannot be less than the direct beam component hitting the ground.
-    let direct_horizontal = dni * sin_elev;
-    let ghi_final = ghi_raw.max(direct_horizontal);
-
-    // DHI is the remainder of the light after accounting for the direct beam
-    let dhi = (ghi_final - direct_horizontal).max(0.0);
-
-    (dni, dhi, ghi_final)
+    (dni, dhi, ghi)
 }
 
 // ===================== PLANE OF ARRAY IRRADIANCE =====================
 
-/// Calculate irradiance on tilted plane-of-array using Perez model
+/// Calculate irradiance on tilted plane-of-array
 ///
-/// Decomposes sky diffuse into circumsolar and horizon brightening components
+/// Sky diffuse uses the isotropic sky model; ground-reflected diffuse uses
+/// an isotropic view-factor model with the given albedo.
 ///
 /// # Arguments
 /// * `dni` - Direct Normal Irradiance (W/m²)
@@ -338,7 +406,7 @@ pub fn plane_of_array_irradiance(
     let cos_aoi = aoi_rad.cos();
     let poa_beam = if cos_aoi > 0.0 && sun_elevation_deg > 0.0 { dni * cos_aoi } else { 0.0 };
 
-    // Sky diffuse using isotropic model (simplified Perez)
+    // Sky diffuse using the isotropic sky model
     // View factor for sky dome
     let sky_view_factor = (1.0 + tilt_rad.cos()) / 2.0;
     let poa_sky_diffuse = dhi * sky_view_factor;
@@ -384,15 +452,20 @@ pub fn calculate_output(
             (config.tilt_deg, config.azimuth_deg)
         }
         TrackingMode::HorizontalAxis => {
-            // HSAT: Axis runs N-S, panel rotates E-W to track sun's azimuth
-            // Tilt stays fixed (configured value)
-            (config.tilt_deg, sun_azimuth_deg)
+            // HSAT: panel rotates about a (possibly tilted) meridian axis;
+            // surface tilt and azimuth both follow from the rotation angle.
+            // config.tilt_deg = axis tilt, config.azimuth_deg = rest-position facing
+            single_axis_tracker_orientation(
+                sun_elevation_deg,
+                sun_azimuth_deg,
+                config.tilt_deg,
+                config.azimuth_deg,
+            )
         }
         TrackingMode::VerticalAxis => {
-            // VSAT: Axis is vertical, panel tilts to track sun's altitude
-            // Azimuth stays fixed (configured value)
-            let tilt = (90.0 - sun_elevation_deg).clamp(0.0, 90.0);
-            (tilt, config.azimuth_deg)
+            // VSAT: panel spins about a vertical axis to track the sun's azimuth
+            // Tilt stays fixed (configured value)
+            (config.tilt_deg, sun_azimuth_deg)
         }
         TrackingMode::DualAxis => {
             // Dual-axis: panel always faces the sun directly
@@ -431,7 +504,8 @@ pub fn calculate_output(
 /// * `config` - Solar panel configuration
 /// * `altitude_m` - Observer altitude in meters
 /// * `day_of_year` - Day of year (1-366)
-/// * `sun_positions` - Iterator of (hour_of_day, elevation_deg, azimuth_deg)
+/// * `sun_positions` - Iterator of (hour_of_day, elevation_deg, azimuth_deg),
+///   in chronological order; hour values may wrap past midnight (23.8 → 0.0)
 ///
 /// # Returns
 /// Daily energy in Wh
@@ -450,9 +524,11 @@ where
     }
 
     // Ensure we start and end with 0 power if the first/last elevation is near 0
-    if positions[0].1 < 0.1 {
-        let (t, _, az) = positions[0];
-        positions[0] = (t, 0.0, az);
+    let last = positions.len() - 1;
+    for idx in [0, last] {
+        if positions[idx].1 < 0.1 {
+            positions[idx].1 = 0.0;
+        }
     }
 
     let mut total_energy_wh = 0.0;
@@ -468,7 +544,7 @@ where
         let output1 = calculate_output(config, elev1, az1, altitude_m, day_of_year);
         let output2 = calculate_output(config, elev2, az2, altitude_m, day_of_year);
 
-        let dt_hours = (t2 - t1).abs();
+        let dt_hours = (t2 - t1).rem_euclid(24.0);
         let avg_power = (output1.power_w + output2.power_w) / 2.0;
         total_energy_wh += avg_power * dt_hours;
     }
@@ -768,17 +844,25 @@ mod tests {
         );
 
         // DNI attenuated but still substantial
+        // (Ineichen DNI formula: b·I0·exp(-0.09·AM·(TL-1)) ≈ 460 W/m² here)
         assert!(
-            output.irradiance.dni > 600.0 && output.irradiance.dni < 700.0,
+            output.irradiance.dni > 400.0 && output.irradiance.dni < 550.0,
             "DNI {} out of range",
             output.irradiance.dni
         );
 
         // GHI low due to sin(11°) ≈ 0.19
         assert!(
-            output.irradiance.ghi > 120.0 && output.irradiance.ghi < 170.0,
+            output.irradiance.ghi > 120.0 && output.irradiance.ghi < 190.0,
             "GHI {} out of range",
             output.irradiance.ghi
+        );
+
+        // Winter diffuse fraction is substantial at this air mass (~0.4)
+        assert!(
+            output.irradiance.dhi > 40.0 && output.irradiance.dhi < 100.0,
+            "DHI {} out of range",
+            output.irradiance.dhi
         );
 
         // AOI ~44° (panel can't fully capture low winter sun)
@@ -790,15 +874,15 @@ mod tests {
 
         // POA boosted vs GHI by tilted panel
         assert!(
-            output.irradiance.poa > output.irradiance.ghi * 3.0,
+            output.irradiance.poa > output.irradiance.ghi * 2.0,
             "POA {} should be much higher than GHI {}",
             output.irradiance.poa,
             output.irradiance.ghi
         );
 
-        // Power ~960W
+        // Power ~780W
         assert!(
-            output.power_w > 900.0 && output.power_w < 1050.0,
+            output.power_w > 700.0 && output.power_w < 900.0,
             "Power {} W out of range",
             output.power_w
         );
@@ -1210,5 +1294,202 @@ mod tests {
         let output = calculate_output(&config, 45.0, 180.0, 0.0, 172);
 
         assert_eq!(output.power_w, 0.0, "Zero efficiency panel should produce zero power");
+    }
+
+    #[test]
+    fn test_irradiance_components_always_consistent() {
+        // GHI = DNI·sin(elevation) + DHI must hold for all conditions
+        for elev in [1.0, 5.0, 11.0, 25.0, 45.0, 70.0, 89.0] {
+            for tl in [2.0, 3.0, 5.0, 7.0] {
+                for alt in [0.0, 1500.0, 3000.0] {
+                    let (dni, dhi, ghi) = ineichen_perez_clearsky(elev, alt, 172, tl);
+                    let sin_elev = (elev as f64).to_radians().sin();
+                    assert!(
+                        (ghi - (dni * sin_elev + dhi)).abs() < 1e-6,
+                        "Inconsistent at elev={elev} tl={tl} alt={alt}: GHI {ghi} != {} + {dhi}",
+                        dni * sin_elev
+                    );
+                    assert!(dni >= 0.0 && dhi >= 0.0 && ghi >= 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_diffuse_fraction_realistic() {
+        // Clear-sky diffuse fraction should be roughly 10-15% at high sun and
+        // increase toward the horizon (longer atmospheric path scatters more).
+        // The old DNI formula made DHI collapse to exactly 0 below ~15° sun.
+        let mut prev_frac = 0.0;
+        for elev in [80.0, 60.0, 40.0, 20.0, 10.0] {
+            let (_, dhi, ghi) = ineichen_perez_clearsky(elev, 0.0, 172, 3.0);
+            let frac = dhi / ghi;
+            assert!(
+                frac > 0.05 && frac < 0.6,
+                "Diffuse fraction {frac:.3} at {elev}° elevation is unphysical"
+            );
+            assert!(
+                frac >= prev_frac,
+                "Diffuse fraction should grow as the sun gets lower ({frac:.3} at {elev}°)"
+            );
+            prev_frac = frac;
+        }
+    }
+
+    #[test]
+    fn test_daily_energy_midnight_wrap() {
+        // Hour-of-day samples wrapping past midnight (23.83 → 0.0) must not be
+        // mis-measured as ~24-hour intervals. This is the arctic midnight-sun
+        // case: the sun is above the horizon when the clock wraps.
+        let cfg = SolarPanelConfig::new(10.0, 35.0, 180.0);
+        let wrapped = vec![
+            (23.0, 5.0, 350.0),
+            (23.833, 5.0, 355.0),
+            (0.0, 5.0, 0.0), // wrapped past midnight
+            (0.833, 5.0, 5.0),
+        ];
+        let unwrapped =
+            vec![(23.0, 5.0, 350.0), (23.833, 5.0, 355.0), (24.0, 5.0, 0.0), (24.833, 5.0, 5.0)];
+        let e_wrapped = calculate_daily_energy(&cfg, 0.0, 172, wrapped.into_iter());
+        let e_unwrapped = calculate_daily_energy(&cfg, 0.0, 172, unwrapped.into_iter());
+        assert!(
+            (e_wrapped - e_unwrapped).abs() < 1e-9,
+            "Wrapped {e_wrapped} Wh != monotonic {e_unwrapped} Wh"
+        );
+    }
+
+    #[test]
+    fn test_daily_energy_constant_power_integration() {
+        // Constant conditions over N hours should integrate to power × N
+        let cfg = SolarPanelConfig::new(10.0, 0.0, 180.0); // flat panel
+        let power = calculate_output(&cfg, 60.0, 180.0, 0.0, 172).power_w;
+        let positions: Vec<_> = (0..=8).map(|i| (10.0 + i as f64 * 0.5, 60.0, 180.0)).collect();
+        let energy = calculate_daily_energy(&cfg, 0.0, 172, positions.into_iter());
+        assert!(
+            (energy - power * 4.0).abs() < 1e-6,
+            "Expected {} Wh over 4h, got {energy} Wh",
+            power * 4.0
+        );
+    }
+
+    #[test]
+    fn test_hsat_orientation_geometry() {
+        // Horizontal N-S axis (axis tilt 0):
+        // Sun due east at any elevation lies in the panel's rotation plane,
+        // so the tracker can face it exactly (AOI = 0)
+        let (tilt, az) = single_axis_tracker_orientation(30.0, 90.0, 0.0, 180.0);
+        let aoi = angle_of_incidence(30.0, 90.0, tilt, az);
+        assert!(aoi < 0.1, "AOI {aoi} should be ~0 for sun due east");
+        assert!((az - 90.0).abs() < 0.1, "Panel should face east, got {az}");
+        assert!((tilt - 60.0).abs() < 0.1, "Tilt should equal sun zenith, got {tilt}");
+
+        // Sun due south: the N-S axis cannot tip the panel south, so it lies
+        // flat and the AOI equals the sun's zenith angle
+        let (tilt, _az) = single_axis_tracker_orientation(50.0, 180.0, 0.0, 180.0);
+        assert!(tilt < 0.1, "Panel should be flat at solar noon, got tilt {tilt}");
+
+        // Sun in the west → panel faces west
+        let (_, az) = single_axis_tracker_orientation(20.0, 270.0, 0.0, 180.0);
+        assert!((az - 270.0).abs() < 0.1, "Panel should face west, got {az}");
+
+        // Tilted axis at rest position: with the sun directly along the panel
+        // rest normal the rotation is 0 and orientation matches (tilt, lean)
+        let (tilt, az) = single_axis_tracker_orientation(90.0 - 20.0, 180.0, 20.0, 180.0);
+        assert!((tilt - 20.0).abs() < 0.1, "Rest tilt should be 20°, got {tilt}");
+        assert!((az - 180.0).abs() < 0.1, "Rest azimuth should be 180°, got {az}");
+    }
+
+    #[test]
+    fn test_hsat_beats_fixed_flat_panel() {
+        // A horizontal-axis tracker should never produce less than the same
+        // panel lying flat (rotation 0 IS the flat panel)
+        let fixed = SolarPanelConfig::new(10.0, 0.0, 180.0);
+        let hsat = SolarPanelConfig::new(10.0, 0.0, 180.0)
+            .with_tracking_mode(TrackingMode::HorizontalAxis);
+
+        // Synthetic day: sun rises east, sets west
+        let positions: Vec<_> = (0..=48)
+            .map(|i| {
+                let h = 6.0 + i as f64 * 0.25;
+                let frac = (h - 6.0) / 12.0;
+                let elev = 55.0 * (PI * frac).sin();
+                (h, elev, 90.0 + 180.0 * frac)
+            })
+            .collect();
+
+        let e_fixed = calculate_daily_energy(&fixed, 0.0, 172, positions.iter().copied());
+        let e_hsat = calculate_daily_energy(&hsat, 0.0, 172, positions.iter().copied());
+
+        assert!(
+            e_hsat > e_fixed * 1.1,
+            "HSAT {e_hsat:.0} Wh should clearly beat flat fixed {e_fixed:.0} Wh"
+        );
+    }
+
+    #[test]
+    fn test_vsat_aoi_is_zenith_minus_tilt() {
+        // A vertical-axis tracker keeps tilt fixed and follows the sun's
+        // azimuth, so AOI = |zenith - tilt| regardless of sun azimuth
+        let config =
+            SolarPanelConfig::new(10.0, 35.0, 180.0).with_tracking_mode(TrackingMode::VerticalAxis);
+
+        for (elev, az) in [(55.0, 90.0), (55.0, 200.0), (30.0, 270.0), (70.0, 10.0)] {
+            let output = calculate_output(&config, elev, az, 0.0, 172);
+            let expected_aoi: f64 = (90.0 - elev - 35.0_f64).abs();
+            assert!(
+                (output.irradiance.aoi_deg - expected_aoi).abs() < 0.1,
+                "VSAT AOI {} != |zenith - tilt| = {expected_aoi} at elev {elev}, az {az}",
+                output.irradiance.aoi_deg
+            );
+        }
+
+        // With tilt matching the zenith angle the AOI is 0
+        let output = calculate_output(&config, 55.0, 123.0, 0.0, 172);
+        assert!(output.irradiance.aoi_deg < 0.1, "AOI {} should be ~0", output.irradiance.aoi_deg);
+    }
+
+    #[test]
+    fn test_dual_axis_beats_single_axis_trackers() {
+        let mk = |mode| SolarPanelConfig::new(10.0, 0.0, 180.0).with_tracking_mode(mode);
+        let positions: Vec<_> = (0..=48)
+            .map(|i| {
+                let h = 6.0 + i as f64 * 0.25;
+                let frac = (h - 6.0) / 12.0;
+                let elev = 50.0 * (PI * frac).sin();
+                (h, elev, 90.0 + 180.0 * frac)
+            })
+            .collect();
+
+        let e_dual = calculate_daily_energy(
+            &mk(TrackingMode::DualAxis),
+            0.0,
+            172,
+            positions.iter().copied(),
+        );
+        let e_hsat = calculate_daily_energy(
+            &mk(TrackingMode::HorizontalAxis),
+            0.0,
+            172,
+            positions.iter().copied(),
+        );
+        // VSAT with a sensible fixed tilt
+        let vsat =
+            SolarPanelConfig::new(10.0, 40.0, 180.0).with_tracking_mode(TrackingMode::VerticalAxis);
+        let e_vsat = calculate_daily_energy(&vsat, 0.0, 172, positions.iter().copied());
+
+        // Dual axis (AOI always ~0) is an upper bound; allow a sliver of
+        // floating point tolerance
+        assert!(e_dual >= e_hsat * 0.999, "Dual {e_dual:.0} < HSAT {e_hsat:.0}");
+        assert!(e_dual >= e_vsat * 0.999, "Dual {e_dual:.0} < VSAT {e_vsat:.0}");
+    }
+
+    #[test]
+    fn test_air_mass_no_nan_at_extreme_altitude() {
+        // The barometric pressure formula has a negative base above ~44 km;
+        // the altitude clamp must keep the result finite
+        for alt in [20_000.0, 44_330.0, 60_000.0, 1.0e6] {
+            let am = air_mass(45.0, alt);
+            assert!(am.is_finite() && am > 0.0, "Air mass {am} at altitude {alt} m");
+        }
     }
 }

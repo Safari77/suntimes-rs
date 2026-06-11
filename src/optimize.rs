@@ -8,6 +8,9 @@ const TILT_GRID_STEP: f64 = 0.5;
 const AZ_GRID_STEP: f64 = 1.0;
 
 /// Constraints for panel optimization (tilt and azimuth ranges)
+///
+/// If `azimuth_min > azimuth_max` the azimuth range wraps through north,
+/// e.g. (300, 60) allows NW through NE.
 #[derive(Debug, Clone, Copy)]
 pub struct OptimizationConstraints {
     /// Minimum allowed tilt (degrees)
@@ -18,11 +21,12 @@ pub struct OptimizationConstraints {
     pub azimuth_min: f64,
     /// Maximum allowed azimuth (degrees)
     pub azimuth_max: f64,
-    /// True if the user explicitly set an azimuth range.
+    /// True if the user explicitly set a non-trivial azimuth range.
     ///
-    /// Gates the azimuth search strategy: a default full 0..360 circle uses a
-    /// cardinal-quadrant scan to handle 0°/360° wraparound, while a user-set
-    /// (possibly narrow) range uses direct golden-section search inside it.
+    /// Gates the azimuth search strategy: a full 0..360 circle (default, or
+    /// explicitly passed) uses a cardinal-quadrant scan to handle 0°/360°
+    /// wraparound, while a user-set narrower range uses direct golden-section
+    /// search inside it (the range itself may wrap, see struct docs).
     ///
     /// Tilt has no wraparound, so no corresponding flag is needed.
     azimuth_explicit: bool,
@@ -43,6 +47,10 @@ impl Default for OptimizationConstraints {
 impl OptimizationConstraints {
     pub fn with_tilt_range(mut self, range: Option<(f64, f64)>) -> Self {
         if let Some((min, max)) = range {
+            // Accept the endpoints in either order: tilt has no wraparound
+            // semantics and an inverted pair would later panic in f64::clamp
+            // (which requires min <= max)
+            let (min, max) = if min <= max { (min, max) } else { (max, min) };
             self.tilt_min = min.clamp(0.0, 90.0);
             self.tilt_max = max.clamp(0.0, 90.0);
         }
@@ -53,15 +61,37 @@ impl OptimizationConstraints {
         if let Some((min, max)) = range {
             self.azimuth_min = min.clamp(0.0, 360.0);
             self.azimuth_max = max.clamp(0.0, 360.0);
-            self.azimuth_explicit = true;
+            // min > max means the range wraps through north (e.g. 300..60).
+            // An explicit full circle is the same as no constraint at all, so
+            // keep the wraparound-aware quadrant search for it.
+            self.azimuth_explicit = !(self.azimuth_min <= 0.0 && self.azimuth_max >= 360.0);
         }
         self
     }
 
-    /// True if the user left the azimuth range at the default full 0..360 circle.
+    /// True if the azimuth range is effectively the full 0..360 circle
+    /// (left at the default, or explicitly set to the full circle).
     /// Callers use this to pick the azimuth search algorithm.
     pub fn azimuth_unconstrained(&self) -> bool {
         !self.azimuth_explicit
+    }
+
+    /// Azimuth range as a continuous interval for searching; the upper bound
+    /// exceeds 360 when the range wraps through north (e.g. 300..60 becomes
+    /// 300..420). Angles taken from this interval must be evaluated and
+    /// reported modulo 360.
+    fn azimuth_interval(&self) -> (f64, f64) {
+        if self.azimuth_min <= self.azimuth_max {
+            (self.azimuth_min, self.azimuth_max)
+        } else {
+            (self.azimuth_min, self.azimuth_max + 360.0)
+        }
+    }
+
+    /// Center of the (possibly wrapped) azimuth range, normalized to [0, 360)
+    fn azimuth_center(&self) -> f64 {
+        let (lo, hi) = self.azimuth_interval();
+        ((lo + hi) / 2.0).rem_euclid(360.0)
     }
 }
 
@@ -122,6 +152,18 @@ fn optimize_fixed_panel(
     )
 }
 
+/// Sun azimuth at the highest sampled elevation: a hemisphere-agnostic initial
+/// guess for the optimal panel azimuth (~180° north of the tropics, ~0/360°
+/// south of them). Falls back to 180° if the sun never rises in the sample.
+fn culmination_azimuth(sun_positions: &[(f64, f64, f64)]) -> f64 {
+    sun_positions
+        .iter()
+        .filter(|p| p.1 > 0.0)
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|p| p.2)
+        .unwrap_or(180.0)
+}
+
 /// Optimize panel orientation with constraints
 pub fn optimize_fixed_panel_constrained(
     base: SolarPanelConfig,
@@ -138,9 +180,11 @@ pub fn optimize_fixed_panel_constrained(
 
     // Helper closure to calculate energy and count evaluations
     // We capture specific variables to avoid cloning the whole context repeatedly
+    // Azimuth is normalized modulo 360 so searches may probe outside [0, 360)
+    // (wraparound ranges and the ±90° quadrant window need this)
     let mut calc_energy = |tilt: f64, az: f64| -> f64 {
         evaluations += 1;
-        let cfg = SolarPanelConfig { tilt_deg: tilt, azimuth_deg: az, ..base };
+        let cfg = SolarPanelConfig { tilt_deg: tilt, azimuth_deg: az.rem_euclid(360.0), ..base };
         solar_panel::calculate_daily_energy(
             &cfg,
             altitude_m,
@@ -152,12 +196,14 @@ pub fn optimize_fixed_panel_constrained(
     // --------------------------------------------------
     // 1) Optimize tilt within constraints
     // --------------------------------------------------
-    // For unconstrained case, use 180° (south) as initial azimuth
-    // For constrained case, use center of azimuth range
+    // For the unconstrained case, start from the sun's culmination azimuth:
+    // a hard-coded 180° tunes the tilt for a panel facing away from the sun
+    // in the southern hemisphere, and the tilt is what the azimuth search
+    // builds on. For the constrained case, use the center of the azimuth range.
     let initial_az = if is_unconstrained {
-        180.0
+        culmination_azimuth(sun_positions)
     } else {
-        (constraints.azimuth_min + constraints.azimuth_max) / 2.0
+        constraints.azimuth_center()
     };
 
     // GSS on constrained tilt range
@@ -182,10 +228,10 @@ pub fn optimize_fixed_panel_constrained(
             // Original algorithm: Coarse Quadrant Search then fine GSS
             // Because azimuth wraps (0 == 360), we check cardinal directions first
             // to identify the correct sector and avoid getting stuck at a boundary.
-            let mut best_sector_az = 180.0;
-            let mut max_sector_e = best_energy; // We already have 180 calculated
+            let mut best_sector_az = initial_az;
+            let mut max_sector_e = best_energy; // We already have initial_az calculated
 
-            for &az_check in &[0.0, 90.0, 270.0] {
+            for &az_check in &[0.0, 90.0, 180.0, 270.0] {
                 let e = calc_energy(best_tilt, az_check);
                 if e > max_sector_e {
                     max_sector_e = e;
@@ -194,6 +240,7 @@ pub fn optimize_fixed_panel_constrained(
             }
 
             // Fine GSS within +/- 90 degrees of the best sector
+            // (may probe outside [0, 360); calc_energy normalizes)
             let search_min = best_sector_az - 90.0;
             let search_max = best_sector_az + 90.0;
 
@@ -205,52 +252,53 @@ pub fn optimize_fixed_panel_constrained(
 
             // Normalize to [0, 360) for final output consistency
             best_az = best_az.rem_euclid(360.0);
-
-            // Recalculate energy at the final snapped point
-            best_energy = calc_energy(best_tilt, best_az);
         } else {
-            // Constrained case: do GSS directly within the range
-            let az_range = constraints.azimuth_max - constraints.azimuth_min;
+            // Constrained case: do GSS directly within the range. The interval
+            // is continuous even for ranges wrapping through north (300..60
+            // becomes 300..420) so lo <= hi always holds and clamp is safe.
+            let (az_lo, az_hi) = constraints.azimuth_interval();
 
-            if az_range > AZ_GRID_STEP {
-                let (raw_az, _) = golden_section_search(
-                    constraints.azimuth_min,
-                    constraints.azimuth_max,
-                    0.8,
-                    |a| calc_energy(best_tilt, a),
-                );
+            if az_hi - az_lo > AZ_GRID_STEP {
+                let (raw_az, _) =
+                    golden_section_search(az_lo, az_hi, 0.8, |a| calc_energy(best_tilt, a));
 
                 // Snap to grid resolution (1.0 degree)
                 best_az = (raw_az / AZ_GRID_STEP).round() * AZ_GRID_STEP;
-                best_az = best_az.clamp(constraints.azimuth_min, constraints.azimuth_max);
+                best_az = best_az.clamp(az_lo, az_hi);
 
                 // Normalize to [0, 360) for final output consistency
                 best_az = best_az.rem_euclid(360.0);
-
-                // Recalculate energy at the final snapped point
-                best_energy = calc_energy(best_tilt, best_az);
             }
         }
+
+        // --------------------------------------------------
+        // 3) Re-optimize tilt at the chosen azimuth
+        // --------------------------------------------------
+        // Tilt and azimuth interact; a single sequential pass leaves the tilt
+        // tuned for the initial azimuth guess (a coordinate-descent trap that
+        // cost ~10% energy when the initial azimuth was far from optimal).
+        let (raw_tilt2, _) =
+            golden_section_search(constraints.tilt_min, constraints.tilt_max, 0.4, |t| {
+                calc_energy(t, best_az)
+            });
+        best_tilt = (raw_tilt2 / TILT_GRID_STEP).round() * TILT_GRID_STEP;
+        best_tilt = best_tilt.clamp(constraints.tilt_min, constraints.tilt_max);
     } else {
         // Horizontal panel → azimuth physically undefined
         // For unconstrained: use 180° (south)
         // For constrained: use center of range
-        best_az = if is_unconstrained {
-            180.0
-        } else {
-            (constraints.azimuth_min + constraints.azimuth_max) / 2.0
-        };
+        best_az = if is_unconstrained { 180.0 } else { constraints.azimuth_center() };
     }
 
     // 2b) Canonicalize azimuth for near-horizontal panels
     // Matches original logic: if tilt is very low, force canonical value
     if best_tilt <= 5.0 {
-        best_az = if is_unconstrained {
-            180.0
-        } else {
-            (constraints.azimuth_min + constraints.azimuth_max) / 2.0
-        };
+        best_az = if is_unconstrained { 180.0 } else { constraints.azimuth_center() };
     }
+
+    // Final energy at the exact orientation we return, so energy_wh always
+    // corresponds to (tilt_deg, azimuth_deg) even after canonicalization
+    best_energy = calc_energy(best_tilt, best_az);
 
     PanelOptimum {
         // Round to 1 decimal place for display consistency (matches original behavior)
@@ -263,7 +311,10 @@ pub fn optimize_fixed_panel_constrained(
 }
 
 /// Optimize tilt for HSAT (Horizontal Single-Axis Tracking)
-/// HSAT tracks azimuth automatically, so we only need to find optimal fixed tilt
+/// HSAT tracks the sun by rotating about its axis automatically, so we only
+/// need to find the optimal axis tilt. The axis lean direction is taken from
+/// `base.azimuth_deg` (the rest-position facing, typically 180° toward the
+/// equator in the northern hemisphere, 0° in the southern).
 pub fn optimize_hsat_tilt(
     base: SolarPanelConfig,
     altitude_m: f64,
@@ -273,13 +324,13 @@ pub fn optimize_hsat_tilt(
 ) -> PanelOptimum {
     let mut evaluations = 0;
 
-    // For HSAT, azimuth tracks the sun, so we create a config with HSAT mode
-    // and only optimize tilt
+    // For HSAT, the panel rotation tracks the sun, so we create a config with
+    // HSAT mode and only optimize the axis tilt
     let mut calc_energy = |tilt: f64| -> f64 {
         evaluations += 1;
         let cfg = SolarPanelConfig {
             tilt_deg: tilt,
-            azimuth_deg: 0.0, // Ignored for HSAT - azimuth tracks sun
+            azimuth_deg: base.azimuth_deg, // Axis lean direction (rest-position facing)
             tracking_mode: crate::solar_panel::TrackingMode::HorizontalAxis,
             ..base
         };
@@ -301,15 +352,16 @@ pub fn optimize_hsat_tilt(
 
     PanelOptimum {
         tilt_deg: (best_tilt * 10.0).round() / 10.0 + 0.0,
-        azimuth_deg: 0.0, // Not applicable for HSAT
+        azimuth_deg: base.azimuth_deg, // Axis lean direction used during optimization
         energy_wh: best_energy,
         evaluations,
     }
 }
 
-/// Optimize azimuth for VSAT (Vertical Single-Axis Tracking)
-/// VSAT tracks altitude automatically, so we only need to find optimal fixed azimuth
-pub fn optimize_vsat_azimuth(
+/// Optimize tilt for VSAT (Vertical Single-Axis Tracking)
+/// VSAT tracks the sun's azimuth automatically (panel spins about a vertical
+/// axis), so we only need to find the optimal fixed tilt.
+pub fn optimize_vsat_tilt(
     base: SolarPanelConfig,
     altitude_m: f64,
     day_of_year: u32,
@@ -318,13 +370,13 @@ pub fn optimize_vsat_azimuth(
 ) -> PanelOptimum {
     let mut evaluations = 0;
 
-    // For VSAT, tilt tracks the sun, so we create a config with VSAT mode
-    // and only optimize azimuth
-    let mut calc_energy = |az: f64| -> f64 {
+    // For VSAT, azimuth tracks the sun, so we create a config with VSAT mode
+    // and only optimize tilt
+    let mut calc_energy = |tilt: f64| -> f64 {
         evaluations += 1;
         let cfg = SolarPanelConfig {
-            tilt_deg: 0.0, // Ignored for VSAT - tilt tracks sun
-            azimuth_deg: az,
+            tilt_deg: tilt,
+            azimuth_deg: base.azimuth_deg, // Ignored for VSAT - azimuth tracks sun
             tracking_mode: crate::solar_panel::TrackingMode::VerticalAxis,
             ..base
         };
@@ -336,34 +388,17 @@ pub fn optimize_vsat_azimuth(
         )
     };
 
-    // Use quadrant search first to handle azimuth wrap-around
-    let mut best_sector_az = 180.0;
-    let mut max_sector_e = calc_energy(180.0);
+    // GSS on constrained tilt range
+    let (raw_tilt, _) =
+        golden_section_search(constraints.tilt_min, constraints.tilt_max, 0.4, &mut calc_energy);
 
-    for &az_check in &[0.0, 90.0, 270.0] {
-        if az_check >= constraints.azimuth_min && az_check <= constraints.azimuth_max {
-            let e = calc_energy(az_check);
-            if e > max_sector_e {
-                max_sector_e = e;
-                best_sector_az = az_check;
-            }
-        }
-    }
-
-    // Fine GSS within +/- 90 degrees of the best sector (clamped to constraints)
-    let search_min = (best_sector_az - 90.0).max(constraints.azimuth_min);
-    let search_max = (best_sector_az + 90.0).min(constraints.azimuth_max);
-
-    let (raw_az, _) = golden_section_search(search_min, search_max, 0.8, &mut calc_energy);
-
-    let best_az = (raw_az / AZ_GRID_STEP).round() * AZ_GRID_STEP;
-    let best_az = best_az.clamp(constraints.azimuth_min, constraints.azimuth_max);
-    let best_az = best_az.rem_euclid(360.0);
-    let best_energy = calc_energy(best_az);
+    let best_tilt = (raw_tilt / TILT_GRID_STEP).round() * TILT_GRID_STEP;
+    let best_tilt = best_tilt.clamp(constraints.tilt_min, constraints.tilt_max);
+    let best_energy = calc_energy(best_tilt);
 
     PanelOptimum {
-        tilt_deg: 0.0, // Not applicable for VSAT
-        azimuth_deg: (best_az * 10.0).round() / 10.0 + 0.0,
+        tilt_deg: (best_tilt * 10.0).round() / 10.0 + 0.0,
+        azimuth_deg: 0.0, // Not applicable for VSAT - azimuth tracks sun
         energy_wh: best_energy,
         evaluations,
     }
@@ -507,7 +542,12 @@ pub fn optimize_yearly_hsat(
     let mut adjustment_periods = Vec::with_capacity(num_adjustments as usize);
     let mut total_energy = 0.0;
 
-    // For each period, find the optimal tilt (azimuth is tracked by HSAT)
+    // Axis lean direction: rest-position panel faces the equator
+    // (180° = south in the northern hemisphere, 0° = north in the southern)
+    let lean_azimuth = if latitude >= 0.0 { 180.0 } else { 0.0 };
+
+    // For each period, find the optimal axis tilt (sun tracking is done by
+    // the HSAT rotation itself)
     for (start_day, end_day) in &periods {
         let period_result = optimize_period_hsat(
             &base_config,
@@ -517,6 +557,7 @@ pub fn optimize_yearly_hsat(
             *start_day,
             *end_day,
             constraints,
+            lean_azimuth,
             sun_pos_generator,
         );
 
@@ -527,12 +568,12 @@ pub fn optimize_yearly_hsat(
             start_day: *start_day,
             end_day: *end_day,
             tilt_deg: period_result.tilt_deg,
-            azimuth_deg: 0.0, // Not applicable for HSAT - azimuth tracks sun
+            azimuth_deg: lean_azimuth, // Axis lean direction (rest-position facing)
             period_energy_wh: period_result.period_energy_wh,
         });
     }
 
-    // Calculate fixed HSAT optimal (single tilt setting for entire year)
+    // Calculate fixed HSAT optimal (single axis tilt setting for entire year)
     let fixed_result = optimize_period_hsat(
         &base_config,
         latitude,
@@ -541,6 +582,7 @@ pub fn optimize_yearly_hsat(
         1,
         days_in_year,
         constraints,
+        lean_azimuth,
         sun_pos_generator,
     );
     total_evaluations += fixed_result.evaluations;
@@ -626,7 +668,8 @@ fn optimize_period_tilt_only(
 }
 
 /// Optimize tilt for HSAT mode for a single period
-/// HSAT tracks azimuth, so we only optimize tilt
+/// HSAT tracks the sun by rotating about its axis, so we only optimize the
+/// axis tilt; `lean_azimuth` sets the rest-position facing of the panel
 fn optimize_period_hsat(
     base_config: &SolarPanelConfig,
     latitude: f64,
@@ -635,6 +678,7 @@ fn optimize_period_hsat(
     start_day: u32,
     end_day: u32,
     constraints: &OptimizationConstraints,
+    lean_azimuth: f64,
     sun_pos_generator: &SunPositionGenerator,
 ) -> PeriodOptimum {
     let mut evaluations = 0;
@@ -648,12 +692,12 @@ fn optimize_period_hsat(
         .map(|&day| (day, sun_pos_generator(latitude, longitude, altitude_m, day)))
         .collect();
 
-    // Calculate period energy for a given tilt with HSAT tracking
+    // Calculate period energy for a given axis tilt with HSAT tracking
     let mut calc_period_energy = |tilt: f64| -> f64 {
         evaluations += 1;
         let cfg = SolarPanelConfig {
             tilt_deg: tilt,
-            azimuth_deg: 0.0, // Ignored for HSAT - azimuth tracks sun
+            azimuth_deg: lean_azimuth, // Axis lean direction (rest-position facing)
             tracking_mode: crate::solar_panel::TrackingMode::HorizontalAxis,
             ..*base_config
         };
@@ -722,7 +766,7 @@ fn select_sample_days(start_day: u32, end_day: u32) -> Vec<u32> {
         // Short period: use all days
         (start_day..=end_day).collect()
     } else if period_length <= 31 {
-        // Medium period: sample every 3-4 days
+        // Medium period: sample every 3rd day
         let mut days = vec![start_day];
         let mut current = start_day + 3;
         while current < end_day {
@@ -752,13 +796,17 @@ fn is_leap_year(year: i32) -> bool {
 }
 
 /// Generic Golden Section Search for finding the maximum of a unimodal function `f`
-/// within the range `[min, max]`.
+/// within the range `[min, max]`. Requires `min <= max` (callers normalize
+/// their ranges; wrapped azimuth ranges are mapped to a continuous interval
+/// before reaching this function).
 ///
 /// Returns (x_at_max, max_value)
 fn golden_section_search<F>(min: f64, max: f64, tol: f64, mut f: F) -> (f64, f64)
 where
     F: FnMut(f64) -> f64,
 {
+    debug_assert!(min <= max, "golden_section_search needs an ordered range, got {min}..{max}");
+
     let phi = (1.0 + 5.0_f64.sqrt()) / 2.0;
     let resphi = 2.0 - phi; // approx 0.382
 
@@ -804,27 +852,35 @@ fn generate_sun_positions(
     date: chrono::NaiveDate,
 ) -> Vec<(f64, f64, f64)> {
     use crate::solar::SolarCalc;
-    use chrono::{Duration, TimeZone, Timelike};
+    use chrono::{Duration, TimeZone};
 
     let solar =
         SolarCalc { lat, lon, alt: altitude_m, delta_t: 69.0, refr: None, target: -1.064699 };
-    // Use noon as a stable anchor
-    let noon = tz.from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap()).single().unwrap();
+    // Use noon as a stable anchor.
+    let noon = tz
+        .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+        .earliest()
+        .expect("invalid local datetime in test helper");
 
     // Step size must match energy integration resolution
     let step_minutes = 10;
     let step = Duration::minutes(step_minutes);
 
     let mut positions = Vec::new();
-    let mut t = noon - Duration::hours(12);
+    let start = noon - Duration::hours(12);
     let end = noon + Duration::hours(12);
+    let mut t = start;
 
     while t <= end {
         let pos = solar.position(t).expect("SPA failed in test helper");
 
-        let hour_of_day = t.time().num_seconds_from_midnight() as f64 / 3600.0;
+        // Elapsed hours since the start of the sampling window: strictly
+        // monotonic and measured in real time, so it is immune to both the
+        // hour-of-day midnight wrap and DST clock jumps which would distort
+        // the trapezoidal time steps in calculate_daily_energy
+        let hours = (t - start).num_seconds() as f64 / 3600.0;
 
-        positions.push((hour_of_day, pos.elevation_angle(), pos.azimuth()));
+        positions.push((hours, pos.elevation_angle(), pos.azimuth()));
 
         t += step;
     }
@@ -1207,5 +1263,230 @@ mod tests {
 
         // Verify the value of the maximum
         assert!((y - 10.0).abs() < 1e-8, "Expected max value y=10.0, got y={:.5}", y);
+    }
+
+    // ------------------------------------------------------------------
+    // Synthetic sun-position tests (no chrono / SPA dependency)
+    // ------------------------------------------------------------------
+
+    /// Synthetic clear day: the sun rises due east at 06:00, culminates at
+    /// noon at `peak_elevation` in the given direction (180 = southern sky for
+    /// northern-hemisphere sites, 0/360 = northern sky for southern-hemisphere
+    /// sites) and sets due west at 18:00. 15-minute resolution.
+    fn synthetic_day(peak_elevation: f64, culmination_az: f64) -> Vec<(f64, f64, f64)> {
+        let southern_sky = (culmination_az - 180.0).abs() < 90.0;
+        (0..=48)
+            .map(|i| {
+                let h = 6.0 + i as f64 * 0.25;
+                let frac = (h - 6.0) / 12.0; // 0 at sunrise, 1 at sunset
+                let elev = peak_elevation * (std::f64::consts::PI * frac).sin();
+                // Sweep east -> culmination direction -> west
+                let az = if southern_sky {
+                    90.0 + 180.0 * frac
+                } else {
+                    (90.0 - 180.0 * frac).rem_euclid(360.0)
+                };
+                (h, elev, az)
+            })
+            .collect()
+    }
+
+    /// True if `az` lies within the (possibly north-wrapping) range
+    fn azimuth_in_range(az: f64, min: f64, max: f64) -> bool {
+        let az = az.rem_euclid(360.0);
+        if min <= max { az >= min && az <= max } else { az >= min || az <= max }
+    }
+
+    fn synthetic_base() -> SolarPanelConfig {
+        SolarPanelConfig::new(10.0, 0.0, 180.0)
+            .with_efficiency(0.20)
+            .with_linke_turbidity(3.0)
+            .with_albedo(0.2)
+    }
+
+    #[test]
+    fn test_inverted_tilt_range_does_not_panic() {
+        let constraints = OptimizationConstraints::default().with_tilt_range(Some((40.0, 20.0)));
+        let positions = synthetic_day(50.0, 180.0);
+        let result =
+            optimize_fixed_panel_constrained(synthetic_base(), 0.0, 172, &positions, &constraints);
+        assert!(
+            result.tilt_deg >= 20.0 && result.tilt_deg <= 40.0,
+            "Tilt {} outside normalized range 20..40",
+            result.tilt_deg
+        );
+        assert!(result.energy_wh > 0.0);
+    }
+
+    #[test]
+    fn test_wrapped_azimuth_range() {
+        let constraints =
+            OptimizationConstraints::default().with_azimuth_range(Some((300.0, 60.0)));
+        // Southern-hemisphere style day: sun culminates in the northern sky,
+        // so the optimum azimuth is near 0/360 - inside the wrapped range
+        let positions = synthetic_day(50.0, 0.0);
+        let result =
+            optimize_fixed_panel_constrained(synthetic_base(), 0.0, 355, &positions, &constraints);
+        assert!(
+            azimuth_in_range(result.azimuth_deg, 300.0, 60.0),
+            "Azimuth {} outside wrapped range 300..60",
+            result.azimuth_deg
+        );
+        assert!(result.tilt_deg > 5.0, "Expected a meaningful tilt, got {}", result.tilt_deg);
+        assert!(result.energy_wh > 0.0);
+    }
+
+    #[test]
+    fn test_explicit_full_circle_is_unconstrained() {
+        // Passing the full circle explicitly must behave exactly like the
+        // default: same wraparound-aware search, same result
+        let full = OptimizationConstraints::default().with_azimuth_range(Some((0.0, 360.0)));
+        assert!(full.azimuth_unconstrained());
+
+        let positions = synthetic_day(45.0, 0.0);
+        let explicit =
+            optimize_fixed_panel_constrained(synthetic_base(), 0.0, 355, &positions, &full);
+        let default = optimize_fixed_panel_constrained(
+            synthetic_base(),
+            0.0,
+            355,
+            &positions,
+            &OptimizationConstraints::default(),
+        );
+        assert_eq!(explicit.tilt_deg, default.tilt_deg);
+        assert_eq!(explicit.azimuth_deg, default.azimuth_deg);
+    }
+
+    #[test]
+    fn test_southern_hemisphere_near_brute_force() {
+        // The sun culminates in the northern sky.
+        let positions = synthetic_day(40.0, 0.0); // winter-ish southern day
+        let base = synthetic_base();
+
+        let mut brute_best = 0.0_f64;
+        let mut tilt = 0.0;
+        while tilt <= 90.0 {
+            let mut az = 0.0;
+            while az < 360.0 {
+                let cfg = SolarPanelConfig { tilt_deg: tilt, azimuth_deg: az, ..base };
+                let e =
+                    solar_panel::calculate_daily_energy(&cfg, 0.0, 355, positions.iter().copied());
+                brute_best = brute_best.max(e);
+                az += 5.0;
+            }
+            tilt += 2.5;
+        }
+
+        let result = optimize_fixed_panel_constrained(
+            base,
+            0.0,
+            355,
+            &positions,
+            &OptimizationConstraints::default(),
+        );
+
+        // Optimum azimuth should be in the northern sky (near 0/360)
+        assert!(
+            azimuth_in_range(result.azimuth_deg, 315.0, 45.0),
+            "Azimuth {} should face the sun's northern culmination",
+            result.azimuth_deg
+        );
+        assert!(
+            result.energy_wh >= brute_best * 0.98,
+            "Optimizer found {:.0} Wh, brute force found {:.0} Wh",
+            result.energy_wh,
+            brute_best
+        );
+    }
+
+    #[test]
+    fn test_reported_energy_matches_reported_orientation() {
+        // energy_wh must always be the energy at the returned (tilt, azimuth),
+        // including after near-horizontal azimuth canonicalization
+        let base = synthetic_base();
+        for (peak, culm, day) in [(75.0, 180.0, 172), (40.0, 0.0, 355), (88.0, 180.0, 172)] {
+            let positions = synthetic_day(peak, culm);
+            let result = optimize_fixed_panel_constrained(
+                base,
+                0.0,
+                day,
+                &positions,
+                &OptimizationConstraints::default(),
+            );
+            let cfg = SolarPanelConfig {
+                tilt_deg: result.tilt_deg,
+                azimuth_deg: result.azimuth_deg,
+                ..base
+            };
+            let recomputed =
+                solar_panel::calculate_daily_energy(&cfg, 0.0, day, positions.iter().copied());
+            // Allow only rounding slack from the 0.1° display rounding
+            assert!(
+                (result.energy_wh - recomputed).abs() <= recomputed * 0.001 + 1e-6,
+                "Reported {:.2} Wh != {:.2} Wh at reported orientation ({}, {})",
+                result.energy_wh,
+                recomputed,
+                result.tilt_deg,
+                result.azimuth_deg
+            );
+        }
+    }
+
+    #[test]
+    fn test_hsat_tilt_optimizer_synthetic() {
+        let positions = synthetic_day(35.0, 180.0); // low winter sun
+        let base = SolarPanelConfig { azimuth_deg: 180.0, ..synthetic_base() };
+        let result =
+            optimize_hsat_tilt(base, 0.0, 355, &positions, &OptimizationConstraints::default());
+        assert!(
+            result.tilt_deg >= 0.0 && result.tilt_deg <= 90.0,
+            "Axis tilt {} out of range",
+            result.tilt_deg
+        );
+        // With a low sun, a leaning axis should beat a flat one
+        let flat_cfg = SolarPanelConfig {
+            tilt_deg: 0.0,
+            tracking_mode: crate::solar_panel::TrackingMode::HorizontalAxis,
+            ..base
+        };
+        let flat_energy =
+            solar_panel::calculate_daily_energy(&flat_cfg, 0.0, 355, positions.iter().copied());
+        assert!(result.tilt_deg > 0.0, "Expected a tilted axis for a low sun");
+        assert!(result.energy_wh >= flat_energy, "Optimized axis tilt should not lose energy");
+        assert_eq!(result.azimuth_deg, 180.0, "Lean azimuth should be reported");
+    }
+
+    #[test]
+    fn test_vsat_tilt_optimizer_synthetic() {
+        let positions = synthetic_day(35.0, 180.0);
+        let result = optimize_vsat_tilt(
+            synthetic_base(),
+            0.0,
+            355,
+            &positions,
+            &OptimizationConstraints::default(),
+        );
+        // The sun's mean zenith over this day is large (peak elevation 35°),
+        // so a substantial fixed tilt is expected
+        assert!(
+            result.tilt_deg > 30.0 && result.tilt_deg <= 90.0,
+            "VSAT tilt {} unreasonable for a 35° peak sun",
+            result.tilt_deg
+        );
+        assert!(result.energy_wh > 0.0);
+
+        // And the optimizer must respect tilt constraints
+        let constrained = optimize_vsat_tilt(
+            synthetic_base(),
+            0.0,
+            355,
+            &positions,
+            &OptimizationConstraints::default().with_tilt_range(Some((10.0, 25.0))),
+        );
+        assert!(
+            constrained.tilt_deg >= 10.0 && constrained.tilt_deg <= 25.0,
+            "Constrained VSAT tilt {} outside 10..25",
+            constrained.tilt_deg
+        );
     }
 }

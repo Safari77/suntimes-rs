@@ -463,7 +463,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         panel_config.as_ref().and_then(|cfg| {
             sun_positions.as_ref().map(|positions| {
                 if args.solarpanel_horizontal_tracking {
-                    // HSAT: optimize tilt only (azimuth is tracked)
+                    // HSAT
                     optimize::optimize_hsat_tilt(
                         *cfg,
                         altitude,
@@ -472,8 +472,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &constraints,
                     )
                 } else if args.solarpanel_vertical_tracking {
-                    // VSAT: optimize azimuth only (tilt is tracked)
-                    optimize::optimize_vsat_azimuth(
+                    // VSAT
+                    optimize::optimize_vsat_tilt(
                         *cfg,
                         altitude,
                         day_of_year,
@@ -496,8 +496,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    let yearly_optimization_result = None;
-    if let Some(num_adjustments) = args.solarpanel_yearly_adjustments {
+    let yearly_optimization_result = if let Some(num_adjustments) =
+        args.solarpanel_yearly_adjustments
+    {
         // Build constraints from CLI arguments
         let constraints = optimize::OptimizationConstraints::default()
             .with_tilt_range(args.solarpanel_tilt_range)
@@ -716,21 +717,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if args.solarpanel_horizontal_tracking {
             println!("=== Optimal HSAT Configuration ===");
-            println!("Optimized tilt for horizontal single-axis tracking on {}", date.date_naive());
-            println!();
-            println!("Optimal tilt    : {:6.1}°", opt_result.tilt_deg);
-            println!("Daily energy    : {}", solar_panel::format_energy(opt_result.energy_wh));
-        } else if args.solarpanel_vertical_tracking {
-            println!("=== Optimal VSAT Configuration ===");
             println!(
-                "Optimized azimuth for vertical single-axis tracking on {}",
+                "Optimized axis tilt for horizontal single-axis tracking on {}",
                 date.date_naive()
             );
             println!();
-            println!("Optimal azimuth : {:6.1}°", opt_result.azimuth_deg);
-            println!("Daily energy    : {}", solar_panel::format_energy(opt_result.energy_wh));
+            println!("Optimal axis tilt : {:6.1}°", opt_result.tilt_deg);
+            println!("Azimuth           : panel rotation tracks the sun");
+            println!("Daily energy      : {}", solar_panel::format_energy(opt_result.energy_wh));
 
-            // Compare with current azimuth
+            // Compare with current axis tilt
             if let Some(current_energy) = daily_energy {
                 let improvement = opt_result.energy_wh - current_energy;
                 let improvement_pct =
@@ -738,8 +734,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 if improvement > 0.1 && improvement_pct > 0.1 {
                     println!(
-                        "vs current ({:.1}° az): {} ({:+.1}%)",
-                        args.solarpanel_azimuth,
+                        "vs current ({:.1}° axis tilt): {} ({:+.1}%)",
+                        args.solarpanel_tilt,
+                        solar_panel::format_energy(current_energy),
+                        improvement_pct
+                    );
+                }
+            }
+        } else if args.solarpanel_vertical_tracking {
+            println!("=== Optimal VSAT Configuration ===");
+            println!("Optimized tilt for vertical single-axis tracking on {}", date.date_naive());
+            println!();
+            println!("Optimal tilt    : {:6.1}°", opt_result.tilt_deg);
+            println!("Azimuth         : tracks the sun");
+            println!("Daily energy    : {}", solar_panel::format_energy(opt_result.energy_wh));
+
+            // Compare with current tilt
+            if let Some(current_energy) = daily_energy {
+                let improvement = opt_result.energy_wh - current_energy;
+                let improvement_pct =
+                    if current_energy > 0.0 { (improvement / current_energy) * 100.0 } else { 0.0 };
+
+                if improvement > 0.1 && improvement_pct > 0.1 {
+                    println!(
+                        "vs current ({:.1}° tilt): {} ({:+.1}%)",
+                        args.solarpanel_tilt,
                         solar_panel::format_energy(current_energy),
                         improvement_pct
                     );

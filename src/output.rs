@@ -532,14 +532,14 @@ pub fn print_solar_panel_info(
         }
         TrackingMode::HorizontalAxis => {
             println!(
-                "Panel     : {:.2} m² @ {:.0}° tilt (horizontal single-axis, tracks azimuth)",
+                "Panel     : {:.2} m² @ {:.0}° axis tilt (horizontal single-axis, rotates to track sun)",
                 config.area_m2, config.tilt_deg
             );
         }
         TrackingMode::VerticalAxis => {
             println!(
-                "Panel     : {:.2} m² @ {:.0}° azimuth (vertical single-axis, tracks altitude)",
-                config.area_m2, config.azimuth_deg
+                "Panel     : {:.2} m² @ {:.0}° tilt (vertical single-axis, tracks azimuth)",
+                config.area_m2, config.tilt_deg
             );
         }
         TrackingMode::DualAxis => {
@@ -638,7 +638,11 @@ pub fn print_yearly_optimization(
         println!("Year: {}", year);
         println!("Number of tilt adjustment periods: {}", result.periods.len());
         println!();
-        println!("HSAT mode: Azimuth tracks sun throughout day, tilt adjusted seasonally");
+        println!("HSAT mode: panel rotation tracks the sun throughout the day,");
+        println!("axis tilt is adjusted seasonally");
+        if !result.periods.is_empty() {
+            println!("Axis lean: rest position faces {:.0}°", result.periods[0].azimuth_deg);
+        }
     } else {
         println!("=== Yearly Solar Panel Optimization (Seasonal Tilt Adjustments) ===");
         println!("Year: {}", year);
@@ -731,7 +735,7 @@ pub fn print_yearly_optimization(
     println!();
     if is_hsat {
         match result.periods.len() {
-            1 => println!("Tip: This is HSAT with fixed tilt - no seasonal adjustments."),
+            1 => println!("Tip: This is HSAT with a fixed axis tilt - no seasonal adjustments."),
             2 => println!(
                 "Tip: 2 tilt adjustments/year can optimize HSAT for summer/winter sun angles."
             ),
