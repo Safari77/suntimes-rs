@@ -1,7 +1,7 @@
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
 use clap::Parser;
-use parse_datetime::parse_datetime_at_date;
+use parse_datetime::{ParsedDateTime, parse_datetime_at_date};
 use solar_positioning::{
     time::DeltaT,
     types::{RefractionCorrection, SunriseResult},
@@ -41,8 +41,16 @@ where
     let parsed_jiff = parse_datetime_at_date(jiff_anchor, input)
         .map_err(|e| format!("Failed to parse '{}': {}", input, e))?;
 
+    // Extract the valid jiff::Zoned object from the v0.15 enum
+    let jiff_zoned = match parsed_jiff {
+        ParsedDateTime::InRange(z) => z,
+        ParsedDateTime::Extended(ext) => {
+            return Err(format!("Parsed date exceeds standard limits: year {}", ext.year));
+        }
+    };
+
     // Convert Jiff Result -> Chrono
-    let ts = parsed_jiff.timestamp();
+    let ts = jiff_zoned.timestamp();
     let dt_utc = Utc
         .timestamp_opt(ts.as_second(), ts.subsec_nanosecond() as u32)
         .single()
