@@ -13,12 +13,11 @@ use std::sync::OnceLock;
 macro_rules! include_bytes_aligned {
     ($align_to:expr, $path:expr) => {{
         #[repr(C, align($align_to))]
-        struct __Aligned<T: ?Sized>(T);
+        struct AlignedSlice<T: ?Sized>(T);
 
-        const __DATA: &'static __Aligned<[u8; include_bytes!($path).len()]> =
-            &__Aligned(*include_bytes!($path));
+        static ALIGNED: &AlignedSlice<[u8]> = &AlignedSlice(*include_bytes!($path));
 
-        &__DATA.0
+        &ALIGNED.0
     }};
 }
 
@@ -479,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_blob_zero_uvi_at_night() {
-        // Sun below horizon should always safely short-circuit to 0.0[cite: 2]
+        // Sun below horizon should always safely short-circuit to 0.0
         let uvi = calculate_uv_index(-5.0, 180, 60.2, 25.3, 50.0, None, 1.3);
         assert_eq!(uvi, 0.0, "Nighttime UV must be exactly 0.0");
     }
