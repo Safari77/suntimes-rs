@@ -399,7 +399,7 @@ fn parse_altitude(s: &str) -> Result<AltitudeArg, String> {
         return Ok(AltitudeArg::Auto);
     }
     let v: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
-    if !(-500.0..=11000.0).contains(&v) {
+    if !v.is_finite() || !(-500.0..=11000.0).contains(&v) {
         return Err(format!("Altitude must be between -500 and 11000 meters, got {}", v));
     }
     Ok(AltitudeArg::Fixed(v))
@@ -407,7 +407,7 @@ fn parse_altitude(s: &str) -> Result<AltitudeArg, String> {
 
 fn parse_positive_f64(s: &str) -> Result<f64, String> {
     let v: f64 = s.parse().map_err(|_| format!("Invalid number: {}", s))?;
-    if v <= 0.0 {
+    if !v.is_finite() || v <= 0.0 {
         return Err(format!("Value must be positive, got {}", v));
     }
     Ok(v)
