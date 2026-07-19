@@ -80,13 +80,21 @@ impl SolarCalc {
         mut b: DateTime<Tz>,
     ) -> Result<Option<SunEvent>, SpaError> {
         // Cache both endpoints: we need `pa`'s azimuth at the final fallback,
-        // and `fb` for the initial sign-change check.
+        // and `pb`'s azimuth if the endpoint itself is already the root.
         let (mut pa, mut fa) = self.position_and_error(a)?;
-        let (_pb, fb) = self.position_and_error(b)?;
+        let (pb, fb) = self.position_and_error(b)?;
 
         // Guard against NaN from invalid inputs
         if !fa.is_finite() || !fb.is_finite() {
             return Ok(None);
+        }
+
+        // If endpoints are already legitimate crossing points, return them.
+        if fa.abs() < 1e-7 {
+            return Ok(Some((a, pa.azimuth())));
+        }
+        if fb.abs() < 1e-7 {
+            return Ok(Some((b, pb.azimuth())));
         }
 
         if fa.signum() == fb.signum() {
@@ -185,10 +193,12 @@ impl SolarCalc {
                 chrono::LocalResult::Single(t) => t,
                 chrono::LocalResult::Ambiguous(t, _) => t,
                 chrono::LocalResult::None => {
-                    // If 12:00 doesn't exist (very rare), try start of day logic
-                    tz.from_local_datetime(&current_naive.and_hms_opt(0, 0, 0).unwrap())
-                        .earliest()
-                        .unwrap_or(start)
+                    // If 12:00 doesn't exist (very rare), fallback to the first
+                    // valid instant of the day using robust local-time probing.
+                    match crate::time::start_of_day_opt(tz, current_naive) {
+                        Some(t) => t,
+                        None => start, // ultimate fallback if the entire day is somehow skipped
+                    }
                 }
             };
 
