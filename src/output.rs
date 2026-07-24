@@ -2,13 +2,13 @@
 //!
 //! Provides formatting functions for terminal and Argos (GNOME Shell) output.
 
-use chrono::DateTime;
+use chrono::{DateTime, Datelike};
 use chrono_tz::Tz;
 use solar_positioning::types::SunriseResult;
 
 use crate::air_quality::{self, AirQualityResponse};
 use crate::cli::AqiPollutant;
-use crate::solar::SunEvent;
+use crate::solar::{ExtremeEvent, SunEvent, YearlyExtremes};
 use crate::solar_panel::{self, SolarPanelOutput, TrackingMode};
 use crate::time::format_hms;
 
@@ -373,6 +373,63 @@ pub fn print_sun_events(
                 println!("Next {} on {} at {}", kind, t.date_naive(), t.format("%H:%M:%S %Z"));
             }
         }
+    }
+}
+
+/// Print the year's extreme sunrise and sunset times.
+///
+/// Terminal output only: the Argos path returns before this is ever reached,
+/// by design — the panel shows today, not the year.
+///
+/// The four lines are ordered by season (the June pair first, then the
+/// December pair for a northern observer) rather than alphabetically, so the
+/// two halves of the year read as pairs.
+///
+/// # Arguments
+/// * `ex` - Extremes as computed by `SolarCalc::yearly_extremes`
+/// * `year` - Calendar year that was scanned
+pub fn print_yearly_extremes(ex: &YearlyExtremes, year: i32) {
+    println!();
+    println!("=== Yearly Extremes ({}) ===", year);
+
+    if ex.earliest_sunrise.is_none() && ex.earliest_sunset.is_none() {
+        println!("The sun never crosses the target altitude during {}.", year);
+        return;
+    }
+
+    print_extreme_line("Earliest Sunrise", &ex.earliest_sunrise);
+    print_extreme_line("Latest Sunset", &ex.latest_sunset);
+    print_extreme_line("Latest Sunrise", &ex.latest_sunrise);
+    print_extreme_line("Earliest Sunset", &ex.earliest_sunset);
+
+    // Polar day / polar night: not every day contributes a crossing, so say
+    // how much of the year the extremes were actually drawn from.
+    let no_sunrise = ex.days_scanned.saturating_sub(ex.days_with_sunrise);
+    let no_sunset = ex.days_scanned.saturating_sub(ex.days_with_sunset);
+    if no_sunrise > 0 || no_sunset > 0 {
+        println!(
+            "Note            : {} of {} days without a sunrise, {} without a sunset",
+            no_sunrise, ex.days_scanned, no_sunset
+        );
+    }
+}
+
+/// Print one extreme line, or `n/a` when that extreme does not exist.
+///
+/// The date is spelled out ("June 19") because the whole point of the block
+/// is *when* in the year the extreme falls; the time keeps the `%H:%M:%S %Z`
+/// shape used by the rest of the terminal output.
+fn print_extreme_line(label: &str, event: &Option<ExtremeEvent>) {
+    match event {
+        Some(e) => println!(
+            "{:<16}: {} {}, {} (azimuth {:.1}°)",
+            label,
+            e.time.format("%B"),
+            e.time.day(),
+            e.time.format("%H:%M:%S %Z"),
+            e.azimuth
+        ),
+        None => println!("{:<16}: n/a", label),
     }
 }
 

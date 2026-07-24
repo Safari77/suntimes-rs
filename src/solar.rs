@@ -3,7 +3,7 @@
 //! Provides the core solar calculation context and position solving algorithms.
 //! Uses the NREL SPA (Solar Position Algorithm) for high-precision calculations.
 
-use chrono::{DateTime, Duration, TimeZone};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use solar_positioning::{
     Horizon,
@@ -19,6 +19,49 @@ pub type SunEvent = (DateTime<Tz>, f64);
 
 /// Sunrise and sunset pair
 pub type SunEvents = (Option<SunEvent>, Option<SunEvent>);
+
+/// One yearly extreme: the event itself plus the clock reading used to rank it.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtremeEvent {
+    /// Time of the event in the observer's time zone
+    pub time: DateTime<Tz>,
+    /// Azimuth of the sun at the event, in degrees
+    pub azimuth: f64,
+    /// Where the event sits on the local clock face, in seconds counted from
+    /// 00:00 of the calendar day it was calculated for.
+    ///
+    /// Normally within `0..86_400`, and then exactly equal to the wall-clock
+    /// reading — including across DST changes, since it is derived from the
+    /// local time fields and not from an elapsed-time subtraction.
+    ///
+    /// Close to the polar circles an event can spill over midnight: a sunrise
+    /// at 23:50 the previous evening, or a sunset at 00:30 the next morning.
+    /// Those get negative values, or values above 86_400, so that the ordering
+    /// stays continuous instead of wrapping around and reporting a sunset just
+    /// after midnight as the "earliest" of the year.
+    pub clock_seconds: i64,
+}
+
+/// The four extreme sunrise/sunset times of a calendar year, plus statistics
+/// about the scan that produced them.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct YearlyExtremes {
+    /// Earliest sunrise by local clock time
+    pub earliest_sunrise: Option<ExtremeEvent>,
+    /// Latest sunrise by local clock time
+    pub latest_sunrise: Option<ExtremeEvent>,
+    /// Earliest sunset by local clock time
+    pub earliest_sunset: Option<ExtremeEvent>,
+    /// Latest sunset by local clock time
+    pub latest_sunset: Option<ExtremeEvent>,
+    /// Calendar days actually scanned: 365 (366 in a leap year), minus any
+    /// day that does not exist in this time zone
+    pub days_scanned: u32,
+    /// Days on which the sun crossed the target elevation going up
+    pub days_with_sunrise: u32,
+    /// Days on which the sun crossed the target elevation going down
+    pub days_with_sunset: u32,
+}
 
 // ===================== SOLAR CALCULATION CONTEXT =====================
 
@@ -102,6 +145,13 @@ impl SolarCalc {
         }
 
         for _ in 0..60 {
+            // chrono Durations are integer nanoseconds: once the bracket is a
+            // single nanosecond wide the midpoint stops moving, and the
+            // remaining iterations repeat the same SPA call for nothing.
+            if b - a <= Duration::nanoseconds(1) {
+                break;
+            }
+
             let m = a + (b - a) / 2;
             // One SPA call per midpoint — no extra call at convergence.
             let (pm, fm) = self.position_and_error(m)?;
@@ -231,6 +281,96 @@ impl SolarCalc {
         }
         Ok(None)
     }
+
+    /// Scan a whole calendar year for the extreme sunrise and sunset times.
+    ///
+    /// Every day is solved with exactly the same machinery the single-day
+    /// output uses (`get_transit` + `solve_from_noon`), so the extremes always
+    /// agree with what the program prints for those dates, and they follow the
+    /// active target elevation — with `--civil` this yields the extremes of
+    /// civil dawn and dusk rather than of sunrise and sunset.
+    ///
+    /// Events are ranked by their position on the local clock face, not by UTC
+    /// instant: "earliest sunrise" is what an observer reading a clock means by
+    /// it, and a DST change genuinely does move sunrise on that clock. See
+    /// [`ExtremeEvent::clock_seconds`] for events that spill across midnight.
+    ///
+    /// A consequence worth knowing about: in a zone whose DST transition falls
+    /// far enough from the solstice, an extreme can land on the transition
+    /// boundary rather than near the solstice. In Sydney *both* sunrise
+    /// extremes do — the last morning before the October change (05:28) and
+    /// the last one before the April change (07:10) — because either side of
+    /// those cliffs the clock reading moves by a whole hour, more than the
+    /// seasonal swing can recover. The sunsets there behave seasonally. Both
+    /// are the correct answer to "earliest and latest by the clock". In zones
+    /// whose transitions sit near the equinoxes — the EU, for one — the
+    /// question does not arise.
+    ///
+    /// The search covers 1 January to 31 December of `year` inclusive. In the
+    /// southern hemisphere the summer extremes straddle New Year, so the latest
+    /// sunset of a calendar year normally lands in early January and the
+    /// earliest sunrise in early December.
+    ///
+    /// `delta_t` is held fixed at the value in `self` for the whole year. Its
+    /// drift over twelve months is well under a second and applies almost
+    /// equally to every day, so it cannot move which day comes out extreme.
+    ///
+    /// # Arguments
+    /// * `tz` - Time zone whose clock the events are read on
+    /// * `year` - Calendar year to scan
+    ///
+    /// # Returns
+    /// The four extremes plus scan statistics. A field is `None` when that
+    /// event never occurs during the year (polar day or polar night).
+    ///
+    /// # Errors
+    /// Propagates an SPA failure from the underlying root solve. Days whose
+    /// transit cannot be computed, and days that do not exist locally at all,
+    /// are skipped rather than treated as errors.
+    ///
+    /// # Cost
+    /// Roughly 45 000 SPA evaluations for a full year — fast in a release
+    /// build, noticeably slower in a debug build. This is why it sits behind
+    /// its own flag rather than running on every invocation.
+    pub fn yearly_extremes(&self, tz: Tz, year: i32) -> Result<YearlyExtremes, SpaError> {
+        let mut ex = YearlyExtremes::default();
+
+        let Some(jan_first) = NaiveDate::from_ymd_opt(year, 1, 1) else {
+            return Ok(ex); // year outside chrono's representable range
+        };
+
+        for day in jan_first.iter_days().take_while(|d| d.year() == year) {
+            // Anchor on local noon, the most stable reference for the transit.
+            let Some(anchor) = crate::time::noon_of_day_opt(tz, day) else {
+                continue; // the whole calendar day is skipped in this zone
+            };
+            ex.days_scanned += 1;
+
+            let Some(transit_res) = self.get_transit(anchor) else {
+                continue; // SPA could not place the transit for this day
+            };
+            let transit = self.extract_transit_time(&transit_res);
+            let (sr, ss) = self.solve_from_noon(transit)?;
+
+            if let Some((t, az)) = sr {
+                ex.days_with_sunrise += 1;
+                let cand =
+                    ExtremeEvent { time: t, azimuth: az, clock_seconds: clock_seconds(t, day) };
+                keep_earlier(&mut ex.earliest_sunrise, cand);
+                keep_later(&mut ex.latest_sunrise, cand);
+            }
+
+            if let Some((t, az)) = ss {
+                ex.days_with_sunset += 1;
+                let cand =
+                    ExtremeEvent { time: t, azimuth: az, clock_seconds: clock_seconds(t, day) };
+                keep_earlier(&mut ex.earliest_sunset, cand);
+                keep_later(&mut ex.latest_sunset, cand);
+            }
+        }
+
+        Ok(ex)
+    }
 }
 
 // ===================== HELPER FUNCTIONS =====================
@@ -245,6 +385,46 @@ impl SolarCalc {
 /// Day length in seconds, or None if either event is missing
 pub fn day_length(sr: &Option<SunEvent>, ss: &Option<SunEvent>) -> Option<i64> {
     Some((ss.as_ref()?.0 - sr.as_ref()?.0).num_seconds())
+}
+
+/// Position of `t` on the local clock face, in seconds from 00:00 of `day`.
+///
+/// Built from the local date and time fields rather than from an elapsed-time
+/// subtraction, so on a DST transition day the result is still the reading a
+/// clock on the wall would show. Events landing on a neighbouring calendar day
+/// are carried by whole days, giving values outside `0..86_400` — see
+/// [`ExtremeEvent::clock_seconds`].
+fn clock_seconds(t: DateTime<Tz>, day: NaiveDate) -> i64 {
+    let day_shift = (t.date_naive() - day).num_days();
+    day_shift * 86_400 + i64::from(t.num_seconds_from_midnight())
+}
+
+/// Keep `cand` if it is earlier on the clock than what `slot` already holds.
+///
+/// Ties keep the incumbent, so the first date in the year wins. Around a
+/// solstice consecutive days differ by only a second or two, but never by
+/// exactly zero at the resolution the bisection works to.
+fn keep_earlier(slot: &mut Option<ExtremeEvent>, cand: ExtremeEvent) {
+    let better = match slot {
+        Some(current) => cand.clock_seconds < current.clock_seconds,
+        None => true,
+    };
+    if better {
+        *slot = Some(cand);
+    }
+}
+
+/// Keep `cand` if it is later on the clock than what `slot` already holds.
+///
+/// Ties keep the incumbent, matching [`keep_earlier`].
+fn keep_later(slot: &mut Option<ExtremeEvent>, cand: ExtremeEvent) {
+    let better = match slot {
+        Some(current) => cand.clock_seconds > current.clock_seconds,
+        None => true,
+    };
+    if better {
+        *slot = Some(cand);
+    }
 }
 
 // ===================== TESTS =====================
@@ -454,5 +634,158 @@ mod tests {
             assert!(day_len > 0);
             assert!(day_len < 24 * 3600);
         }
+    }
+
+    /// Build a sea-level NOAA-style calculator for the yearly extreme tests.
+    fn extremes_calc(lat: f64, lon: f64, year: i32) -> SolarCalc {
+        let delta_t = DeltaT::estimate_from_date(year, 6).unwrap();
+        SolarCalc {
+            lat,
+            lon,
+            alt: 0.0,
+            delta_t,
+            refr: Some(RefractionCorrection::standard()),
+            target: -SOLAR_RADIUS_DEG - horizon_dip_deg(lat, 0.0),
+        }
+    }
+
+    #[test]
+    fn test_yearly_extremes_straddle_the_solstices() {
+        let lat = 60.4;
+        let lon = 25.1;
+        let ex = extremes_calc(lat, lon, 2025).yearly_extremes(Helsinki, 2025).unwrap();
+
+        // Southern Finland: every day of the year has both events.
+        assert_eq!(ex.days_scanned, 365);
+        assert_eq!(ex.days_with_sunrise, 365);
+        assert_eq!(ex.days_with_sunset, 365);
+
+        let er = ex.earliest_sunrise.unwrap().time;
+        let ls = ex.latest_sunset.unwrap().time;
+        let lr = ex.latest_sunrise.unwrap().time;
+        let es = ex.earliest_sunset.unwrap().time;
+
+        // The equation of time makes the four extremes straddle the solstices
+        // instead of landing on them: the earliest sunrise comes days before
+        // the June solstice and the latest sunset days after it, while the
+        // earliest sunset precedes the December solstice and the latest
+        // sunrise follows it.
+        assert_eq!(er.month(), 6, "earliest sunrise should be in June, got {}", er);
+        assert!(er.day() < 21, "earliest sunrise should precede the solstice, got {}", er);
+
+        assert_eq!(ls.month(), 6, "latest sunset should be in June, got {}", ls);
+        assert!(ls.day() > 21, "latest sunset should follow the solstice, got {}", ls);
+
+        assert_eq!(es.month(), 12, "earliest sunset should be in December, got {}", es);
+        assert!(es.day() < 21, "earliest sunset should precede the solstice, got {}", es);
+
+        assert_eq!(lr.month(), 12, "latest sunrise should be in December, got {}", lr);
+        assert!(lr.day() > 21, "latest sunrise should follow the solstice, got {}", lr);
+
+        // Sanity: the extremes are ordered on the clock, and at this latitude
+        // no event crosses midnight, so the ranking key is exactly the
+        // wall-clock reading.
+        let (er_key, lr_key) =
+            (ex.earliest_sunrise.unwrap().clock_seconds, ex.latest_sunrise.unwrap().clock_seconds);
+        let (es_key, ls_key) =
+            (ex.earliest_sunset.unwrap().clock_seconds, ex.latest_sunset.unwrap().clock_seconds);
+
+        assert!(er_key < lr_key);
+        assert!(es_key < ls_key);
+        assert_eq!(er_key, i64::from(er.num_seconds_from_midnight()));
+        assert_eq!(ls_key, i64::from(ls.num_seconds_from_midnight()));
+    }
+
+    #[test]
+    fn test_yearly_extremes_southern_hemisphere() {
+        use chrono_tz::Australia::Sydney;
+
+        let ex = extremes_calc(-33.87, 151.21, 2025).yearly_extremes(Sydney, 2025).unwrap();
+
+        let er = ex.earliest_sunrise.unwrap().time;
+        let ls = ex.latest_sunset.unwrap().time;
+        let lr = ex.latest_sunrise.unwrap().time;
+        let es = ex.earliest_sunset.unwrap().time;
+
+        // Sunsets follow the seasons, flipped: the summer maximum spills past
+        // New Year — the scan is a calendar year, so it lands in early January
+        // rather than December — and the winter minimum sits in mid-June. Both
+        // are broad plateaus (Jan 6-9 all read 20:09), so only the month is
+        // worth asserting; which day inside the plateau wins is decided by
+        // seconds and is model-sensitive.
+        assert!(matches!(ls.month(), 12 | 1), "latest sunset should be in Dec/Jan, got {}", ls);
+        assert_eq!(es.month(), 6, "earliest sunset should be in June, got {}", es);
+
+        // Sunrises do not follow the seasons here. Sydney's DST runs October
+        // to April and both sunrise extremes land on its edges, not near a
+        // solstice:
+        //
+        //   Oct 4, 05:28 AEST - last morning before the clocks go forward.
+        //                       From Oct 5 the same sunrise reads an hour
+        //                       later, and December only recovers to 05:37.
+        //   Apr 5, 07:10 AEDT - last morning before they go back. The June
+        //                       maximum only reaches 07:01 AEST.
+        //
+        // Each wins by about nine minutes over the seasonal candidate, and by
+        // a further minute over the day beside it, so the dates are stable.
+        // Ranking by clock time instead of by UTC instant is the whole point
+        // of the feature: for a DST zone these are the right answers, not
+        // artefacts to be assert-ed away.
+        assert_eq!(
+            (er.month(), er.day()),
+            (10, 4),
+            "earliest sunrise should be the last morning before DST starts, got {}",
+            er
+        );
+        assert_eq!(
+            (lr.month(), lr.day()),
+            (4, 5),
+            "latest sunrise should be the last morning before DST ends, got {}",
+            lr
+        );
+    }
+
+    #[test]
+    fn test_yearly_extremes_polar_gaps_are_skipped() {
+        use chrono_tz::Europe::Oslo;
+
+        // Tromsø: polar night around midwinter, midnight sun around midsummer.
+        let ex = extremes_calc(69.6492, 18.9553, 2025).yearly_extremes(Oslo, 2025).unwrap();
+
+        assert_eq!(ex.days_scanned, 365);
+        assert!(
+            ex.days_with_sunrise < 365 && ex.days_with_sunset < 365,
+            "expected days without sunrise/sunset at 69.6°N, got {} / {}",
+            ex.days_with_sunrise,
+            ex.days_with_sunset
+        );
+        // Well over half the year still has ordinary sunrises and sunsets.
+        assert!(ex.days_with_sunrise > 200 && ex.days_with_sunset > 200);
+
+        // All four extremes still exist — the polar gaps are skipped, not
+        // treated as missing data or as errors.
+        assert!(ex.earliest_sunrise.is_some());
+        assert!(ex.latest_sunrise.is_some());
+        assert!(ex.earliest_sunset.is_some());
+        assert!(ex.latest_sunset.is_some());
+    }
+
+    #[test]
+    fn test_clock_seconds_carries_across_midnight() {
+        use chrono::NaiveDate;
+
+        let day = NaiveDate::from_ymd_opt(2025, 6, 21).unwrap();
+
+        // Same day: the key is the plain wall-clock reading.
+        let noon = Helsinki.with_ymd_and_hms(2025, 6, 21, 12, 0, 0).unwrap();
+        assert_eq!(clock_seconds(noon, day), 12 * 3600);
+
+        // Sunset spilling into the next morning stays "late", not "early".
+        let after_midnight = Helsinki.with_ymd_and_hms(2025, 6, 22, 0, 30, 0).unwrap();
+        assert_eq!(clock_seconds(after_midnight, day), 24 * 3600 + 30 * 60);
+
+        // Sunrise on the previous evening stays "early", not "late".
+        let before_midnight = Helsinki.with_ymd_and_hms(2025, 6, 20, 23, 50, 0).unwrap();
+        assert_eq!(clock_seconds(before_midnight, day), -10 * 60);
     }
 }

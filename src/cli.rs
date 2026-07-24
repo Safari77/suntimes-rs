@@ -223,6 +223,15 @@ pub struct Args {
     #[arg(long)]
     pub astro: bool,
 
+    /// Show the year's extreme sunrise and sunset times: earliest and latest
+    /// sunrise, earliest and latest sunset, with the dates they fall on.
+    /// Scans the whole calendar year of --date (the current year by default)
+    /// and honours --civil/--nautical/--astro, in which case the extremes are
+    /// those of the twilight boundary. Terminal output only — this is never
+    /// added to --argos.
+    #[arg(long)]
+    pub extremes: bool,
+
     /// Date for calculations (e.g., "2024-12-25" or "today"); defaults to today
     #[arg(long)]
     pub date: Option<String>,

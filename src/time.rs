@@ -97,6 +97,24 @@ pub fn start_of_day(tz: Tz, d: NaiveDate, fallback: DateTime<Tz>) -> DateTime<Tz
     start_of_day_opt(tz, d).unwrap_or(fallback)
 }
 
+/// Find a stable reference instant on the given local calendar day.
+///
+/// Prefers 12:00 local time, which is the most robust anchor for solar
+/// transit calculations, and falls back to [`start_of_day_opt`] when local
+/// noon does not exist (a DST/offset shift skipped it — very rare, but e.g.
+/// Lord Howe-style shifts or historical midday transitions can do it).
+///
+/// Returns `None` only when the entire calendar day is missing in this zone
+/// (e.g. Samoa, 2011-12-30).
+pub fn noon_of_day_opt(tz: Tz, d: NaiveDate) -> Option<DateTime<Tz>> {
+    // Infallible: 12:00:00 is always a valid NaiveTime
+    let noon = NaiveTime::from_hms_opt(12, 0, 0).expect("12:00:00 is a valid NaiveTime");
+    match tz.from_local_datetime(&d.and_time(noon)) {
+        LocalResult::Single(t) | LocalResult::Ambiguous(t, _) => Some(t),
+        LocalResult::None => start_of_day_opt(tz, d),
+    }
+}
+
 // ===================== FORMATTING =====================
 
 /// Format a duration in seconds as "Xh Ym Zs".
@@ -341,6 +359,28 @@ mod tests {
         let fallback = Apia.with_ymd_and_hms(2011, 12, 31, 0, 0, 0).unwrap();
         let sod = start_of_day(Apia, d, fallback);
         assert_eq!(sod, fallback);
+    }
+
+    #[test]
+    fn test_noon_of_day_normal() {
+        use chrono::NaiveDate;
+        use chrono_tz::Europe::Helsinki;
+
+        let d = NaiveDate::from_ymd_opt(2025, 7, 1).unwrap();
+        let noon = noon_of_day_opt(Helsinki, d).unwrap();
+        assert_eq!(noon.hour(), 12);
+        assert_eq!(noon.minute(), 0);
+        assert_eq!(noon.date_naive(), d);
+    }
+
+    #[test]
+    fn test_noon_of_day_missing_day() {
+        use chrono::NaiveDate;
+        use chrono_tz::Pacific::Apia;
+
+        // Samoa skipped Dec 30, 2011 entirely: neither noon nor midnight exists.
+        let d = NaiveDate::from_ymd_opt(2011, 12, 30).unwrap();
+        assert!(noon_of_day_opt(Apia, d).is_none());
     }
 
     #[test]

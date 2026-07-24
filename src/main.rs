@@ -705,6 +705,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         date,
     );
 
+    // Yearly extreme sunrise/sunset times. Terminal-only by construction:
+    // the Argos branch above has already returned, so this can never widen
+    // the panel output.
+    if args.extremes {
+        let extremes = calc.yearly_extremes(tz, date.year())?;
+        output::print_yearly_extremes(&extremes, date.year());
+    }
+
     if target_dt.is_none() {
         output::print_uv_info(&panel_output_label, uv_current, uv_max);
     }
