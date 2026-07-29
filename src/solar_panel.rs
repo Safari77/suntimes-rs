@@ -302,7 +302,9 @@ pub fn extraterrestrial_irradiance(day_of_year: u32) -> f64 {
 /// - Ineichen, P. (2008). "A broadband simplified version of the Solis clear sky model"
 ///
 /// DHI is derived as the remainder GHI - DNI·sin(elevation), so the three
-/// components are always physically consistent.
+/// components are always physically consistent. DNI is held below Ineichen's
+/// empirical beam limit, which keeps the diffuse remainder strictly positive
+/// rather than merely non-negative.
 ///
 /// # Arguments
 /// * `sun_elevation_deg` - Sun elevation in degrees
@@ -362,9 +364,13 @@ pub fn ineichen_perez_clearsky(
     // the diffuse component to zero.
     let b = 0.664 + 0.163 / fh1;
     let dni_raw = b * i0 * (-0.09 * am * (tl - 1.0)).exp();
-    // The beam cannot exceed extraterrestrial irradiance, nor can its
-    // horizontal projection exceed GHI; the latter cap guarantees DHI >= 0
-    let dni = dni_raw.min(i0).min(ghi / sin_elev.max(1e-9));
+
+    // Ineichen's empirical beam limit (SE 73, 157 & SE 73, 312): the beam's
+    // horizontal projection may not exceed a turbidity- and altitude-dependent
+    // fraction of GHI.
+    let beam_fraction = (1.0 - (0.1 - 0.2 * (-tl).exp()) / (0.1 + 0.882 / fh1)).max(0.0);
+    // The beam cannot exceed extraterrestrial irradiance either
+    let dni = dni_raw.min(i0).min(beam_fraction * ghi / sin_elev.max(1e-9));
 
     // 3. DHI is the remainder of the light after accounting for the direct beam,
     // so GHI = DNI·sin(h) + DHI holds by construction
@@ -1340,6 +1346,33 @@ mod tests {
                 "Diffuse fraction should grow as the sun gets lower ({frac:.3} at {elev}°)"
             );
             prev_frac = frac;
+        }
+    }
+
+    #[test]
+    fn test_diffuse_never_collapses_to_zero() {
+        // A clear sky always scatters something. Limiting the beam at the bare
+        // GHI/sin(h) let it consume the entire global at high altitude and very
+        // low sun, leaving DHI at exactly zero; the empirical beam limit keeps
+        // a small remainder everywhere the sun is above the horizon.
+        for elev in [0.5, 1.0, 5.0, 15.0, 45.0, 89.0] {
+            for tl in [1.0, 2.0, 3.0, 5.0, 10.0] {
+                for alt in [-430.0, 0.0, 1830.0, 5000.0, 11000.0] {
+                    let (dni, dhi, ghi) = ineichen_perez_clearsky(elev, alt, 172, tl);
+                    assert!(ghi > 0.0, "GHI {ghi} at elev {elev}, TL {tl}, alt {alt} m");
+                    assert!(
+                        dhi > 0.0,
+                        "Diffuse collapsed to {dhi} at elev {elev}, TL {tl}, alt {alt} m"
+                    );
+                    assert!(dni >= 0.0, "Negative DNI {dni}");
+                    // and the components still add up
+                    let sin_elev = elev.to_radians().sin();
+                    assert!(
+                        (ghi - (dni * sin_elev + dhi)).abs() < 1e-6,
+                        "Inconsistent at elev {elev}, TL {tl}, alt {alt} m"
+                    );
+                }
+            }
         }
     }
 
