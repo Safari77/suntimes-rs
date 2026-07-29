@@ -24,6 +24,13 @@ const DEFAULT_LINKE_TURBIDITY: f64 = 3.0;
 /// Default ground albedo (typical grass/soil)
 const DEFAULT_ALBEDO: f64 = 0.2;
 
+/// Largest axis tilt accepted by the single-axis tracker model.
+/// An exactly vertical axis would be a VSAT and leaves the rest-position
+/// normal undefined, so the axis is kept just short of vertical.
+/// Optimizers should search within this bound, otherwise they can report an
+/// axis tilt that is not the one the energy figure was computed for.
+pub const MAX_TRACKER_AXIS_TILT_DEG: f64 = 89.0;
+
 // ===================== TRACKING MODES =====================
 
 /// Solar panel tracking mode
@@ -195,7 +202,7 @@ pub fn single_axis_tracker_orientation(
     lean_azimuth_deg: f64,
 ) -> (f64, f64) {
     // An exactly vertical axis would be a VSAT; keep the rest-normal well defined
-    let tau = axis_tilt_deg.clamp(0.0, 89.0).to_radians();
+    let tau = axis_tilt_deg.clamp(0.0, MAX_TRACKER_AXIS_TILT_DEG).to_radians();
     let lean = lean_azimuth_deg.to_radians();
     let alpha = sun_elevation_deg.to_radians();
     let sun_az = sun_azimuth_deg.to_radians();
