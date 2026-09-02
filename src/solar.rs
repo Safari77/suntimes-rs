@@ -200,14 +200,48 @@ impl SolarCalc {
     /// # Returns
     /// SunriseResult containing transit information
     pub fn get_transit(&self, date: DateTime<Tz>) -> Option<SunriseResult<DateTime<Tz>>> {
-        spa::sunrise_sunset_for_horizon(
+        let res = spa::sunrise_sunset_for_horizon(
             date,
             self.lat,
             self.lon,
             self.delta_t,
             Horizon::SunriseSunset,
         )
-        .ok()
+        .ok()?;
+
+        // If the transit returned is ~24 hours away from the target instant, the solar day
+        // straddles the calendar midnight boundary (common near the antimeridian in UTC).
+        // Re-anchor to the adjacent calendar day so the transit belongs to the solar day of `date`.
+        let transit = self.extract_transit_time(&res);
+        let diff_hours = (transit - date).num_milliseconds() as f64 / 3_600_000.0;
+
+        if diff_hours < -18.0 {
+            if let Some(next_date) = date.checked_add_signed(Duration::days(1)) {
+                if let Ok(next_res) = spa::sunrise_sunset_for_horizon(
+                    next_date,
+                    self.lat,
+                    self.lon,
+                    self.delta_t,
+                    Horizon::SunriseSunset,
+                ) {
+                    return Some(next_res);
+                }
+            }
+        } else if diff_hours > 18.0 {
+            if let Some(prev_date) = date.checked_sub_signed(Duration::days(1)) {
+                if let Ok(prev_res) = spa::sunrise_sunset_for_horizon(
+                    prev_date,
+                    self.lat,
+                    self.lon,
+                    self.delta_t,
+                    Horizon::SunriseSunset,
+                ) {
+                    return Some(prev_res);
+                }
+            }
+        }
+
+        Some(res)
     }
 
     /// Extract the transit time from a SunriseResult.
@@ -787,5 +821,48 @@ mod tests {
         // Sunrise on the previous evening stays "early", not "late".
         let before_midnight = Helsinki.with_ymd_and_hms(2025, 6, 20, 23, 50, 0).unwrap();
         assert_eq!(clock_seconds(before_midnight, day), -10 * 60);
+    }
+
+    // regression for suncalc #187: getTimes must anchor to the local solar day containing the input instant.
+    // Rounding to the nearest UTC noon first put antimeridian longitudes a full day off whenever the
+    // input landed within minutes of that UTC boundary — the local solar day is ~12 h out of phase there.
+    #[test]
+    fn test_get_times_resolves_the_anchored_solar_day_at_every_longitude() {
+        // regression for #187: getTimes must anchor to the local solar day containing the input instant.
+        // Rounding to the nearest UTC noon first put antimeridian longitudes a full day off whenever the
+        // input landed within minutes of that UTC boundary — the local solar day is ~12 h out of phase there.
+        let day = UTC.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap();
+        let lat: f64 = 40.0;
+        let hour_ms: f64 = 3_600_000.0;
+
+        let refraction = Some(RefractionCorrection::standard());
+        let target_alt = -SOLAR_RADIUS_DEG;
+        let delta_t = DeltaT::estimate_from_date(2026, 8).expect("DeltaT estimate for 2026");
+
+        let longitudes: [f64; 10] =
+            [-180.0, -179.9, -179.7, -179.676, -179.6, -90.0, 0.0, 90.0, 179.9, 180.0];
+
+        for &lng in &longitudes {
+            let offset_ms = ((lng / 15.0) * hour_ms).round() as i64;
+            let anchor = day - chrono::Duration::milliseconds(offset_ms); // that longitude's own local solar noon
+
+            let calc = SolarCalc {
+                lat,
+                lon: lng,
+                alt: 0.0,
+                delta_t,
+                refr: refraction,
+                target: target_alt,
+            };
+
+            let noon_res = calc
+                .get_transit(anchor)
+                .unwrap_or_else(|| panic!("failed to calculate transit for lng {lng}"));
+            let solar_noon = calc.extract_transit_time(&noon_res);
+
+            let off = (solar_noon - anchor).num_milliseconds() as f64 / hour_ms;
+
+            assert!(off.abs() < 1.0, "lng {lng}: solarNoon {off:.2} h from local solar noon");
+        }
     }
 }
