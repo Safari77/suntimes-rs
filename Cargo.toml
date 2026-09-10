@@ -12,7 +12,7 @@ solar-positioning = "0.5"
 clap = { version = "4.6", features = ["derive", "env"] }
 chrono = "0.4"
 chrono-tz = "0.10"
-tzf-rs = "1.1"
+tzf-rs = "2"
 humantime = "2.3"
 iana-time-zone = "0.1"
 serde_json = "1.0"
