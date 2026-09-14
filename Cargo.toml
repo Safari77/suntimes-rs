@@ -22,7 +22,7 @@ jiff = { version = "0.2", features = ["serde"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 # Air-quality / pollen fetch + on-disk cache
 ureq = "3"
-dirs = "6"
+dirs = "7"
 tempfile = "3"
 
 [profile.release]
