@@ -6,10 +6,8 @@
 use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike};
 use chrono_tz::Tz;
 use solar_positioning::{
-    Horizon,
-    error::Error as SpaError,
-    spa,
-    types::{RefractionCorrection, SunriseResult},
+    Error as SpaError, Horizon, Location, RefractionCorrection, SolarEvents, SolarPosition,
+    SolarPositions,
 };
 
 // ===================== TYPES =====================
@@ -19,6 +17,17 @@ pub type SunEvent = (DateTime<Tz>, f64);
 
 /// Sunrise and sunset pair
 pub type SunEvents = (Option<SunEvent>, Option<SunEvent>);
+
+/// Result of a sunrise/sunset calculation for a single day.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SunriseResult<T> {
+    /// Normal day with sunrise, solar transit, and sunset.
+    RegularDay { sunrise: T, transit: T, sunset: T },
+    /// Polar day: the sun never sets below the horizon.
+    AllDay { transit: T },
+    /// Polar night: the sun never rises above the horizon.
+    AllNight { transit: T },
+}
 
 /// One yearly extreme: the event itself plus the clock reading used to rank it.
 #[derive(Clone, Copy, Debug)]
@@ -87,24 +96,28 @@ pub struct SolarCalc {
 }
 
 impl SolarCalc {
+    /// Observer geographic location helper.
+    #[inline]
+    fn location(&self) -> Location {
+        Location { latitude: self.lat, longitude: self.lon }
+    }
+
     /// Compute the solar position and the elevation residual (`elevation - target`)
     /// in a single SPA evaluation.
     ///
     /// This is the fundamental cached primitive used by the bisection search —
     /// we call into SPA exactly once per time point and reuse the result for both
     /// the residual test and (at convergence) the azimuth readout.
-    fn position_and_error(
-        &self,
-        t: DateTime<Tz>,
-    ) -> Result<(solar_positioning::SolarPosition, f64), SpaError> {
-        let pos = spa::solar_position(t, self.lat, self.lon, self.alt, self.delta_t, self.refr)?;
+    fn position_and_error(&self, t: DateTime<Tz>) -> Result<(SolarPosition, f64), SpaError> {
+        let pos =
+            SolarPositions::new().at(&t, self.location(), self.alt, self.delta_t, self.refr)?;
         let err = pos.elevation_angle() - self.target;
         Ok((pos, err))
     }
 
     /// Get the solar position at a given time.
-    pub fn position(&self, t: DateTime<Tz>) -> Result<solar_positioning::SolarPosition, SpaError> {
-        spa::solar_position(t, self.lat, self.lon, self.alt, self.delta_t, self.refr)
+    pub fn position(&self, t: DateTime<Tz>) -> Result<SolarPosition, SpaError> {
+        SolarPositions::new().at(&t, self.location(), self.alt, self.delta_t, self.refr)
     }
 
     /// Solve for the time when sun crosses target elevation using bisection.
@@ -200,14 +213,62 @@ impl SolarCalc {
     /// # Returns
     /// SunriseResult containing transit information
     pub fn get_transit(&self, date: DateTime<Tz>) -> Option<SunriseResult<DateTime<Tz>>> {
-        let res = spa::sunrise_sunset_for_horizon(
-            date,
-            self.lat,
-            self.lon,
-            self.delta_t,
-            Horizon::SunriseSunset,
-        )
-        .ok()?;
+        let loc = self.location();
+        let tz = date.timezone();
+
+        let calc_day = |d: DateTime<Tz>| -> Option<SunriseResult<DateTime<Tz>>> {
+            let day = SolarEvents::new()
+                .for_date(d.date_naive(), &tz, loc, self.delta_t, Horizon::SunriseSunset)
+                .ok()?;
+
+            let transit = if let Some(t) =
+                day.transits.iter().min_by_key(|&&t| (t - d).num_milliseconds().abs()).copied()
+            {
+                t
+            } else {
+                let prev_day = d.date_naive().pred_opt().and_then(|pd| {
+                    SolarEvents::new()
+                        .for_date(pd, &tz, loc, self.delta_t, Horizon::SunriseSunset)
+                        .ok()
+                });
+                let next_day = d.date_naive().succ_opt().and_then(|nd| {
+                    SolarEvents::new()
+                        .for_date(nd, &tz, loc, self.delta_t, Horizon::SunriseSunset)
+                        .ok()
+                });
+
+                let mut candidates = Vec::new();
+                if let Some(pd) = prev_day {
+                    candidates.extend(pd.transits);
+                }
+                if let Some(nd) = next_day {
+                    candidates.extend(nd.transits);
+                }
+                candidates.into_iter().min_by_key(|&t| (t - d).num_milliseconds().abs())?
+            };
+
+            if day.always_above() {
+                Some(SunriseResult::AllDay { transit })
+            } else if day.always_below() {
+                Some(SunriseResult::AllNight { transit })
+            } else {
+                let sunrise = day.rises.first().copied().unwrap_or(transit);
+                let sunset = day.sets.first().copied().unwrap_or(transit);
+                Some(SunriseResult::RegularDay { sunrise, transit, sunset })
+            }
+        };
+
+        let mut res = calc_day(date);
+        if res.is_none() {
+            if let Some(next_date) = date.checked_add_signed(Duration::days(1)) {
+                res = calc_day(next_date);
+            }
+            if res.is_none()
+                && let Some(prev_date) = date.checked_sub_signed(Duration::days(1)) {
+                    res = calc_day(prev_date);
+                }
+        }
+        let res = res?;
 
         // If the transit returned is ~24 hours away from the target instant, the solar day
         // straddles the calendar midnight boundary (common near the antimeridian in UTC).
@@ -216,30 +277,15 @@ impl SolarCalc {
         let diff_hours = (transit - date).num_milliseconds() as f64 / 3_600_000.0;
 
         if diff_hours < -18.0 {
-            if let Some(next_date) = date.checked_add_signed(Duration::days(1)) {
-                if let Ok(next_res) = spa::sunrise_sunset_for_horizon(
-                    next_date,
-                    self.lat,
-                    self.lon,
-                    self.delta_t,
-                    Horizon::SunriseSunset,
-                ) {
+            if let Some(next_date) = date.checked_add_signed(Duration::days(1))
+                && let Some(next_res) = calc_day(next_date) {
                     return Some(next_res);
                 }
-            }
-        } else if diff_hours > 18.0 {
-            if let Some(prev_date) = date.checked_sub_signed(Duration::days(1)) {
-                if let Ok(prev_res) = spa::sunrise_sunset_for_horizon(
-                    prev_date,
-                    self.lat,
-                    self.lon,
-                    self.delta_t,
-                    Horizon::SunriseSunset,
-                ) {
+        } else if diff_hours > 18.0
+            && let Some(prev_date) = date.checked_sub_signed(Duration::days(1))
+                && let Some(prev_res) = calc_day(prev_date) {
                     return Some(prev_res);
                 }
-            }
-        }
 
         Some(res)
     }
@@ -471,7 +517,7 @@ mod tests {
     use chrono::TimeZone;
     use chrono_tz::Europe::Helsinki;
     use chrono_tz::UTC;
-    use solar_positioning::time::DeltaT;
+    use solar_positioning::delta_t;
 
     #[test]
     fn test_dead_sea_sunrise_shift() {
@@ -480,7 +526,7 @@ mod tests {
         let lat = 31.0;
         let lon = 35.4;
 
-        let delta_t: f64 = DeltaT::estimate_from_date(2025, 7).unwrap();
+        let delta_t: f64 = delta_t::estimate_from_date(2025, 7).unwrap();
         let refraction = Some(RefractionCorrection::standard());
 
         let base_alt = -SOLAR_RADIUS_DEG;
@@ -528,7 +574,7 @@ mod tests {
         let tz = Helsinki;
         let lat = 31.0;
         let lon = 35.4;
-        let delta_t = DeltaT::estimate_from_date(2025, 7).unwrap();
+        let delta_t = delta_t::estimate_from_date(2025, 7).unwrap();
         let refraction = Some(RefractionCorrection::standard());
 
         let date = tz.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
@@ -537,13 +583,12 @@ mod tests {
         let target_alt = -6.0;
 
         // Get solar noon (same for both)
-        let res = spa::sunrise_sunset_for_horizon(date, lat, lon, delta_t, Horizon::CivilTwilight)
+        let location = Location { latitude: lat, longitude: lon };
+        let day_events = SolarEvents::new()
+            .for_date(date.date_naive(), &tz, location, delta_t, Horizon::CivilTwilight)
             .unwrap();
 
-        let noon = match res {
-            SunriseResult::RegularDay { transit, .. } => transit,
-            _ => panic!("Expected civil twilight on this date"),
-        };
+        let noon = *day_events.transits.first().expect("Expected civil twilight on this date");
 
         // Low altitude observer
         let calc_low =
@@ -570,7 +615,9 @@ mod tests {
         let tz = Oslo;
         let lat = 69.6492;
         let lon = 18.9553;
-        let delta_t = DeltaT::estimate_from_date(2025, 5).unwrap();
+        let delta_t = delta_t::estimate_from_date(2025, 5).unwrap();
+        let location = Location { latitude: lat, longitude: lon };
+        let calculator = SolarEvents::new();
 
         let mut found_midnight_sun = false;
 
@@ -578,11 +625,11 @@ mod tests {
         for day in 15..25 {
             let date = tz.with_ymd_and_hms(2025, 5, day, 0, 0, 0).unwrap();
 
-            let res =
-                spa::sunrise_sunset_for_horizon(date, lat, lon, delta_t, Horizon::SunriseSunset)
-                    .unwrap();
+            let day_events = calculator
+                .for_date(date.date_naive(), &tz, location, delta_t, Horizon::SunriseSunset)
+                .unwrap();
 
-            if matches!(res, SunriseResult::AllDay { .. }) {
+            if day_events.always_above() {
                 found_midnight_sun = true;
                 break;
             }
@@ -609,7 +656,7 @@ mod tests {
                     _ => continue, // Invalid or ambiguous date (DST etc.)
                 };
 
-                let delta_t = DeltaT::estimate_from_date(year, month).unwrap();
+                let delta_t = delta_t::estimate_from_date(year, month).unwrap();
 
                 let calc =
                     SolarCalc { lat, lon, alt: 0.0, delta_t, refr: refraction, target: target_alt };
@@ -641,7 +688,7 @@ mod tests {
         for &year in &years {
             let date = UTC.with_ymd_and_hms(year, 6, 21, 0, 0, 0).unwrap();
 
-            let delta_t = match DeltaT::estimate_from_date(year, 6) {
+            let delta_t = match delta_t::estimate_from_date(year, 6) {
                 Ok(dt) => dt,
                 Err(_) => continue, // Explicitly respect ΔT limits
             };
@@ -672,7 +719,7 @@ mod tests {
 
     /// Build a sea-level NOAA-style calculator for the yearly extreme tests.
     fn extremes_calc(lat: f64, lon: f64, year: i32) -> SolarCalc {
-        let delta_t = DeltaT::estimate_from_date(year, 6).unwrap();
+        let delta_t = delta_t::estimate_from_date(year, 6).unwrap();
         SolarCalc {
             lat,
             lon,
@@ -837,7 +884,7 @@ mod tests {
 
         let refraction = Some(RefractionCorrection::standard());
         let target_alt = -SOLAR_RADIUS_DEG;
-        let delta_t = DeltaT::estimate_from_date(2026, 8).expect("DeltaT estimate for 2026");
+        let delta_t = delta_t::estimate_from_date(2026, 8).expect("DeltaT estimate for 2026");
 
         let longitudes: [f64; 10] =
             [-180.0, -179.9, -179.7, -179.676, -179.6, -90.0, 0.0, 90.0, 179.9, 180.0];

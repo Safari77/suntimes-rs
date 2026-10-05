@@ -2,9 +2,9 @@
 //!
 //! Provides formatting functions for terminal and Argos (GNOME Shell) output.
 
+use crate::solar::SunriseResult;
 use chrono::{DateTime, Datelike};
 use chrono_tz::Tz;
-use solar_positioning::types::SunriseResult;
 
 use crate::air_quality::{self, AirQualityResponse};
 use crate::cli::AqiPollutant;

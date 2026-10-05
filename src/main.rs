@@ -1,11 +1,9 @@
+use crate::solar::SunriseResult;
 use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
 use chrono_tz::Tz;
 use clap::Parser;
 use parse_datetime::{ParsedDateTime, parse_datetime_at_date};
-use solar_positioning::{
-    time::DeltaT,
-    types::{RefractionCorrection, SunriseResult},
-};
+use solar_positioning::{RefractionCorrection, delta_t};
 
 mod air_quality;
 mod cli;
@@ -122,7 +120,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let find_start_of_day =
         |d: chrono::NaiveDate| -> DateTime<Tz> { time::start_of_day(tz, d, date) };
 
-    let delta_t: f64 = DeltaT::estimate_from_date(date.year(), date.month())?;
+    let delta_t: f64 = delta_t::estimate_from_date(date.year(), date.month())?;
 
     // Fetch air quality / pollen / elevation if any of the relevant
     // flags is active. The fetch is cached on disk for an hour, so
