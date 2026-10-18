@@ -157,3 +157,6 @@ Notes
 =====
 `--timezone location` uses about 30 ms on startup.
 tzf-rs loads a binary map of the entire world’s timezone boundaries. This map is stored as a Protocol Buffer.
+
+### Screenshot
+![Screenshot argos](screenshot.png)
