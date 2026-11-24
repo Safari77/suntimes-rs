@@ -31,10 +31,10 @@ where
     let jiff_tz = jiff::tz::TimeZone::get(&tz_name)
         .map_err(|e| format!("Jiff failed to load tz '{}': {}", tz_name, e))?;
 
-    let jiff_anchor =
+    let jiff_anchor: jiff::ZonedDateTime =
         jiff::Timestamp::new(anchor.timestamp(), anchor.timestamp_subsec_nanos() as i32)
             .map_err(|e| format!("Timestamp conversion failed: {}", e))?
-            .to_zoned(jiff_tz);
+            .to_zoned_datetime(jiff_tz);
 
     let parsed_jiff = parse_datetime_at_date(jiff_anchor, input)
         .map_err(|e| format!("Failed to parse '{}': {}", input, e))?;
