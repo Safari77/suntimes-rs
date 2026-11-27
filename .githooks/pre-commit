@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MODE="staged"
+if [ "$#" -gt 0 ]; then
+    case "$1" in
+        --all)
+            if [ "$#" -ne 1 ]; then
+                printf '%s\n' "Usage: $0 [--all]" >&2
+                exit 2
+            fi
+            MODE="all"
+            ;;
+        *)
+            printf '%s\n' "Usage: $0 [--all]" >&2
+            exit 2
+            ;;
+    esac
+fi
+
+if ! command -v -- rustfmt >/dev/null 2>&1; then
+    printf '%s\n' "ERROR: rustfmt not found in PATH; cannot verify Rust formatting." >&2
+    exit 1
+fi
+
+cd -- "$(git rev-parse --show-toplevel)"
+
+check_blob() {
+    local file="$1"
+    local dir
+    dir="$(dirname -- "$file")"
+
+    if ! git show ":$file" | (
+        if [ -d "$dir" ]; then
+            cd -- "$dir"
+        fi
+        rustfmt --check --edition 2024
+    ); then
+        printf 'ERROR: Unformatted Rust file: %s\n' "$file" >&2
+        return 1
+    fi
+}
+
+RUST_FAILED=0
+
+if [ "$MODE" = "all" ]; then
+    # Check formatting of every tracked Rust file in the index
+    while IFS= read -r -d '' entry; do
+        meta="${entry%%$'\t'*}"
+        file="${entry#*$'\t'}"
+        mode="${meta%% *}"
+        if [ "$mode" != "100644" ] && [ "$mode" != "100755" ]; then
+            continue
+        fi
+        if ! check_blob "$file"; then
+            RUST_FAILED=1
+        fi
+    done < <(git ls-files --stage -z -- '*.rs')
+else
+    # Check formatting of each staged Rust file in the index without touching working tree files
+    while IFS= read -r -d '' meta && IFS= read -r -d '' file; do
+        read -r _oldmode newmode _rest <<< "$meta"
+        if [ "$newmode" != "100644" ] && [ "$newmode" != "100755" ]; then
+            continue
+        fi
+        if ! check_blob "$file"; then
+            RUST_FAILED=1
+        fi
+    done < <(git diff --cached --raw -z --no-renames --diff-filter=AMT -- '*.rs')
+fi
+
+if [ "$RUST_FAILED" -ne 0 ]; then
+    printf '\n%s\n' "ERROR: Rust formatting check failed (cargo fmt --check)." >&2
+    if [ "$MODE" = "all" ]; then
+        printf '%s\n' "Run 'cargo fmt' and commit the formatting fixes." >&2
+    else
+        printf '%s\n' "Run 'cargo fmt' and re-stage your changes before committing." >&2
+    fi
+fi
+
+if [ "$RUST_FAILED" -ne 0 ]; then
+    exit 1
+fi
