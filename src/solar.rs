@@ -3,8 +3,9 @@
 //! Provides the core solar calculation context and position solving algorithms.
 //! Uses the NREL SPA (Solar Position Algorithm) for high-precision calculations.
 
-use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike};
-use chrono_tz::Tz;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
+use jiff::{SignedDuration, Timestamp, ToSpan, ZonedDateTime};
 use solar_positioning::{
     Error as SpaError, Horizon, Location, RefractionCorrection, SolarEvents, SolarPosition,
     SolarPositions,
@@ -13,7 +14,7 @@ use solar_positioning::{
 // ===================== TYPES =====================
 
 /// Time and azimuth of a sun event (sunrise/sunset)
-pub type SunEvent = (DateTime<Tz>, f64);
+pub type SunEvent = (ZonedDateTime, f64);
 
 /// Sunrise and sunset pair
 pub type SunEvents = (Option<SunEvent>, Option<SunEvent>);
@@ -30,10 +31,10 @@ pub enum SunriseResult<T> {
 }
 
 /// One yearly extreme: the event itself plus the clock reading used to rank it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ExtremeEvent {
     /// Time of the event in the observer's time zone
-    pub time: DateTime<Tz>,
+    pub time: ZonedDateTime,
     /// Azimuth of the sun at the event, in degrees
     pub azimuth: f64,
     /// Where the event sits on the local clock face, in seconds counted from
@@ -53,7 +54,7 @@ pub struct ExtremeEvent {
 
 /// The four extreme sunrise/sunset times of a calendar year, plus statistics
 /// about the scan that produced them.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct YearlyExtremes {
     /// Earliest sunrise by local clock time
     pub earliest_sunrise: Option<ExtremeEvent>,
@@ -108,33 +109,25 @@ impl SolarCalc {
     /// This is the fundamental cached primitive used by the bisection search —
     /// we call into SPA exactly once per time point and reuse the result for both
     /// the residual test and (at convergence) the azimuth readout.
-    fn position_and_error(&self, t: DateTime<Tz>) -> Result<(SolarPosition, f64), SpaError> {
+    fn position_and_error(&self, t: Timestamp) -> Result<(SolarPosition, f64), SpaError> {
         let pos =
-            SolarPositions::new().at(&t, self.location(), self.alt, self.delta_t, self.refr)?;
+            SolarPositions::new().at(t, self.location(), self.alt, self.delta_t, self.refr)?;
         let err = pos.elevation_angle() - self.target;
         Ok((pos, err))
     }
 
-    /// Get the solar position at a given time.
-    pub fn position(&self, t: DateTime<Tz>) -> Result<SolarPosition, SpaError> {
-        SolarPositions::new().at(&t, self.location(), self.alt, self.delta_t, self.refr)
+    /// Get the solar position at a given instant.
+    pub fn position(&self, t: Timestamp) -> Result<SolarPosition, SpaError> {
+        SolarPositions::new().at(t, self.location(), self.alt, self.delta_t, self.refr)
     }
 
-    /// Solve for the time when sun crosses target elevation using bisection.
-    ///
-    /// # Arguments
-    /// * `a` - Start of search interval
-    /// * `b` - End of search interval
-    ///
-    /// # Returns
-    /// The crossing time and azimuth, or `Ok(None)` if no crossing exists in
-    /// the interval. Returns `Err` only on underlying SPA failure (invalid
-    /// inputs or out-of-range date).
-    pub fn solve_root(
+    /// Bisect over `Timestamp` (which is `Copy`) to avoid `ZonedDateTime`
+    /// clones inside the 60-iteration hot loop.
+    fn solve_root_ts(
         &self,
-        mut a: DateTime<Tz>,
-        mut b: DateTime<Tz>,
-    ) -> Result<Option<SunEvent>, SpaError> {
+        mut a: Timestamp,
+        mut b: Timestamp,
+    ) -> Result<Option<(Timestamp, f64)>, SpaError> {
         // Cache both endpoints: we need `pa`'s azimuth at the final fallback,
         // and `pb`'s azimuth if the endpoint itself is already the root.
         let (mut pa, mut fa) = self.position_and_error(a)?;
@@ -157,15 +150,17 @@ impl SolarCalc {
             return Ok(None);
         }
 
+        let one_ns = SignedDuration::from_nanos(1);
         for _ in 0..60 {
-            // chrono Durations are integer nanoseconds: once the bracket is a
+            // SignedDuration has nanosecond resolution: once the bracket is a
             // single nanosecond wide the midpoint stops moving, and the
             // remaining iterations repeat the same SPA call for nothing.
-            if b - a <= Duration::nanoseconds(1) {
+            let span = b.duration_since(a);
+            if span <= one_ns {
                 break;
             }
 
-            let m = a + (b - a) / 2;
+            let m = a + span / 2;
             // One SPA call per midpoint — no extra call at convergence.
             let (pm, fm) = self.position_and_error(m)?;
 
@@ -191,6 +186,28 @@ impl SolarCalc {
         Ok(Some((a, pa.azimuth())))
     }
 
+    /// Solve for the time when sun crosses target elevation using bisection.
+    ///
+    /// # Arguments
+    /// * `a` - Start of search interval
+    /// * `b` - End of search interval
+    ///
+    /// # Returns
+    /// The crossing time and azimuth, or `Ok(None)` if no crossing exists in
+    /// the interval. Returns `Err` only on underlying SPA failure (invalid
+    /// inputs or out-of-range date).
+    #[allow(dead_code)]
+    pub fn solve_root(
+        &self,
+        a: &ZonedDateTime,
+        b: &ZonedDateTime,
+    ) -> Result<Option<SunEvent>, SpaError> {
+        let tz = a.time_zone();
+        Ok(self
+            .solve_root_ts(a.timestamp(), b.timestamp())?
+            .map(|(ts, az)| (ts.to_zoned_datetime(tz.clone()), az)))
+    }
+
     /// Solve for sunrise and sunset from solar noon.
     ///
     /// # Arguments
@@ -198,10 +215,16 @@ impl SolarCalc {
     ///
     /// # Returns
     /// Tuple of (sunrise, sunset) events
-    pub fn solve_from_noon(&self, noon: DateTime<Tz>) -> Result<SunEvents, SpaError> {
-        let span = Duration::hours(12);
-        let sr = self.solve_root(noon - span, noon)?;
-        let ss = self.solve_root(noon, noon + span)?;
+    pub fn solve_from_noon(&self, noon: &ZonedDateTime) -> Result<SunEvents, SpaError> {
+        let tz = noon.time_zone();
+        let noon_ts = noon.timestamp();
+        let span = SignedDuration::from_hours(12);
+        let sr = self
+            .solve_root_ts(noon_ts - span, noon_ts)?
+            .map(|(ts, az)| (ts.to_zoned_datetime(tz.clone()), az));
+        let ss = self
+            .solve_root_ts(noon_ts, noon_ts + span)?
+            .map(|(ts, az)| (ts.to_zoned_datetime(tz.clone()), az));
         Ok((sr, ss))
     }
 
@@ -212,28 +235,33 @@ impl SolarCalc {
     ///
     /// # Returns
     /// SunriseResult containing transit information
-    pub fn get_transit(&self, date: DateTime<Tz>) -> Option<SunriseResult<DateTime<Tz>>> {
+    pub fn get_transit(&self, date: &ZonedDateTime) -> Option<SunriseResult<ZonedDateTime>> {
         let loc = self.location();
-        let tz = date.timezone();
+        let tz = date.time_zone();
+        let one_day = SignedDuration::from_hours(24);
 
-        let calc_day = |d: DateTime<Tz>| -> Option<SunriseResult<DateTime<Tz>>> {
+        let calc_day = |d: &ZonedDateTime| -> Option<SunriseResult<ZonedDateTime>> {
             let day = SolarEvents::new()
-                .for_date(d.date_naive(), &tz, loc, self.delta_t, Horizon::SunriseSunset)
+                .for_date(d.date(), tz, loc, self.delta_t, Horizon::SunriseSunset)
                 .ok()?;
 
-            let transit = if let Some(t) =
-                day.transits.iter().min_by_key(|&&t| (t - d).num_milliseconds().abs()).copied()
+            let d_ts = d.timestamp();
+            let transit = if let Some(t) = day
+                .transits
+                .iter()
+                .min_by_key(|t| t.timestamp().duration_since(d_ts).as_millis().abs())
+                .cloned()
             {
                 t
             } else {
-                let prev_day = d.date_naive().pred_opt().and_then(|pd| {
+                let prev_day = d.date().yesterday().ok().and_then(|pd| {
                     SolarEvents::new()
-                        .for_date(pd, &tz, loc, self.delta_t, Horizon::SunriseSunset)
+                        .for_date(pd, tz, loc, self.delta_t, Horizon::SunriseSunset)
                         .ok()
                 });
-                let next_day = d.date_naive().succ_opt().and_then(|nd| {
+                let next_day = d.date().tomorrow().ok().and_then(|nd| {
                     SolarEvents::new()
-                        .for_date(nd, &tz, loc, self.delta_t, Horizon::SunriseSunset)
+                        .for_date(nd, tz, loc, self.delta_t, Horizon::SunriseSunset)
                         .ok()
                 });
 
@@ -244,7 +272,9 @@ impl SolarCalc {
                 if let Some(nd) = next_day {
                     candidates.extend(nd.transits);
                 }
-                candidates.into_iter().min_by_key(|&t| (t - d).num_milliseconds().abs())?
+                candidates
+                    .into_iter()
+                    .min_by_key(|t| t.timestamp().duration_since(d_ts).as_millis().abs())?
             };
 
             if day.always_above() {
@@ -252,21 +282,22 @@ impl SolarCalc {
             } else if day.always_below() {
                 Some(SunriseResult::AllNight { transit })
             } else {
-                let sunrise = day.rises.first().copied().unwrap_or(transit);
-                let sunset = day.sets.first().copied().unwrap_or(transit);
+                let sunrise = day.rises.into_iter().next().unwrap_or_else(|| transit.clone());
+                let sunset = day.sets.into_iter().next().unwrap_or_else(|| transit.clone());
                 Some(SunriseResult::RegularDay { sunrise, transit, sunset })
             }
         };
 
         let mut res = calc_day(date);
         if res.is_none() {
-            if let Some(next_date) = date.checked_add_signed(Duration::days(1)) {
-                res = calc_day(next_date);
+            if let Ok(next_date) = date.checked_add(one_day) {
+                res = calc_day(&next_date);
             }
             if res.is_none()
-                && let Some(prev_date) = date.checked_sub_signed(Duration::days(1)) {
-                    res = calc_day(prev_date);
-                }
+                && let Ok(prev_date) = date.checked_sub(one_day)
+            {
+                res = calc_day(&prev_date);
+            }
         }
         let res = res?;
 
@@ -274,28 +305,33 @@ impl SolarCalc {
         // straddles the calendar midnight boundary (common near the antimeridian in UTC).
         // Re-anchor to the adjacent calendar day so the transit belongs to the solar day of `date`.
         let transit = self.extract_transit_time(&res);
-        let diff_hours = (transit - date).num_milliseconds() as f64 / 3_600_000.0;
+        let diff_hours = transit.duration_since(date).as_secs_f64() / 3600.0;
 
         if diff_hours < -18.0 {
-            if let Some(next_date) = date.checked_add_signed(Duration::days(1))
-                && let Some(next_res) = calc_day(next_date) {
-                    return Some(next_res);
-                }
+            if let Ok(next_date) = date.checked_add(one_day)
+                && let Some(next_res) = calc_day(&next_date)
+            {
+                return Some(next_res);
+            }
         } else if diff_hours > 18.0
-            && let Some(prev_date) = date.checked_sub_signed(Duration::days(1))
-                && let Some(prev_res) = calc_day(prev_date) {
-                    return Some(prev_res);
-                }
+            && let Ok(prev_date) = date.checked_sub(one_day)
+            && let Some(prev_res) = calc_day(&prev_date)
+        {
+            return Some(prev_res);
+        }
 
         Some(res)
     }
 
     /// Extract the transit time from a SunriseResult.
-    pub fn extract_transit_time(&self, res: &SunriseResult<DateTime<Tz>>) -> DateTime<Tz> {
+    pub fn extract_transit_time<'a>(
+        &self,
+        res: &'a SunriseResult<ZonedDateTime>,
+    ) -> &'a ZonedDateTime {
         match res {
-            SunriseResult::RegularDay { transit, .. } => *transit,
-            SunriseResult::AllDay { transit } => *transit,
-            SunriseResult::AllNight { transit } => *transit,
+            SunriseResult::RegularDay { transit, .. }
+            | SunriseResult::AllDay { transit }
+            | SunriseResult::AllNight { transit } => transit,
         }
     }
 
@@ -311,53 +347,42 @@ impl SolarCalc {
     /// within 370 days, `Err` on SPA failure.
     pub fn find_next_event(
         &self,
-        start: DateTime<Tz>,
-    ) -> Result<Option<(String, DateTime<Tz>)>, SpaError> {
-        let tz = start.timezone();
-        let mut current_naive = start.date_naive();
+        start: &ZonedDateTime,
+    ) -> Result<Option<(String, ZonedDateTime)>, SpaError> {
+        let tz = start.time_zone();
+        let mut current_date = start.date();
 
         for _ in 0..370 {
-            // Safe Anchor: Find a valid time on this calendar day.
-            // We prefer 12:00:00 as it is the most stable reference for solar events.
-            let d = match tz.from_local_datetime(&current_naive.and_hms_opt(12, 0, 0).unwrap()) {
-                chrono::LocalResult::Single(t) => t,
-                chrono::LocalResult::Ambiguous(t, _) => t,
-                chrono::LocalResult::None => {
-                    // If 12:00 doesn't exist (very rare), fallback to the first
-                    // valid instant of the day using robust local-time probing.
-                    match crate::time::start_of_day_opt(tz, current_naive) {
-                        Some(t) => t,
-                        None => start, // ultimate fallback if the entire day is somehow skipped
-                    }
-                }
-            };
+            // Safe Anchor: prefer 12:00:00 local, falling back to first valid instant
+            // of the day, and ultimately to `start` if the entire day was skipped.
+            let d = crate::time::noon_of_day_opt(tz, current_date).unwrap_or_else(|| start.clone());
 
-            if let Some(transit_res) = self.get_transit(d) {
+            if let Some(transit_res) = self.get_transit(&d) {
                 let transit = self.extract_transit_time(&transit_res);
                 let (sr, ss) = self.solve_from_noon(transit)?;
 
                 let mut events = Vec::new();
                 if let Some((t, _)) = sr
-                    && t > start
+                    && t > *start
                 {
                     events.push(("Sunrise", t));
                 }
                 if let Some((t, _)) = ss
-                    && t > start
+                    && t > *start
                 {
                     events.push(("Sunset", t));
                 }
 
-                if let Some((kind, t)) = events.into_iter().min_by_key(|(_, t)| *t) {
+                if let Some((kind, t)) = events.into_iter().min_by_key(|(_, t)| t.timestamp()) {
                     return Ok(Some((kind.into(), t)));
                 }
             }
 
             // Move to the next calendar day safely
-            let Some(next) = current_naive.succ_opt() else {
+            let Ok(next) = current_date.tomorrow() else {
                 return Ok(None);
             };
-            current_naive = next;
+            current_date = next;
         }
         Ok(None)
     }
@@ -412,21 +437,24 @@ impl SolarCalc {
     /// Roughly 45 000 SPA evaluations for a full year — fast in a release
     /// build, noticeably slower in a debug build. This is why it sits behind
     /// its own flag rather than running on every invocation.
-    pub fn yearly_extremes(&self, tz: Tz, year: i32) -> Result<YearlyExtremes, SpaError> {
+    pub fn yearly_extremes(&self, tz: &TimeZone, year: i32) -> Result<YearlyExtremes, SpaError> {
         let mut ex = YearlyExtremes::default();
 
-        let Some(jan_first) = NaiveDate::from_ymd_opt(year, 1, 1) else {
-            return Ok(ex); // year outside chrono's representable range
+        let Ok(year_i16) = i16::try_from(year) else {
+            return Ok(ex); // year outside Jiff's representable range (-9999..=9999)
+        };
+        let Ok(jan_first) = Date::new(year_i16, 1, 1) else {
+            return Ok(ex);
         };
 
-        for day in jan_first.iter_days().take_while(|d| d.year() == year) {
+        for day in jan_first.series(1.day()).take_while(|d| d.year() == year_i16) {
             // Anchor on local noon, the most stable reference for the transit.
             let Some(anchor) = crate::time::noon_of_day_opt(tz, day) else {
                 continue; // the whole calendar day is skipped in this zone
             };
             ex.days_scanned += 1;
 
-            let Some(transit_res) = self.get_transit(anchor) else {
+            let Some(transit_res) = self.get_transit(&anchor) else {
                 continue; // SPA could not place the transit for this day
             };
             let transit = self.extract_transit_time(&transit_res);
@@ -434,17 +462,17 @@ impl SolarCalc {
 
             if let Some((t, az)) = sr {
                 ex.days_with_sunrise += 1;
-                let cand =
-                    ExtremeEvent { time: t, azimuth: az, clock_seconds: clock_seconds(t, day) };
-                keep_earlier(&mut ex.earliest_sunrise, cand);
+                let cs = clock_seconds(&t, day);
+                let cand = ExtremeEvent { time: t, azimuth: az, clock_seconds: cs };
+                keep_earlier(&mut ex.earliest_sunrise, cand.clone());
                 keep_later(&mut ex.latest_sunrise, cand);
             }
 
             if let Some((t, az)) = ss {
                 ex.days_with_sunset += 1;
-                let cand =
-                    ExtremeEvent { time: t, azimuth: az, clock_seconds: clock_seconds(t, day) };
-                keep_earlier(&mut ex.earliest_sunset, cand);
+                let cs = clock_seconds(&t, day);
+                let cand = ExtremeEvent { time: t, azimuth: az, clock_seconds: cs };
+                keep_earlier(&mut ex.earliest_sunset, cand.clone());
                 keep_later(&mut ex.latest_sunset, cand);
             }
         }
@@ -464,7 +492,7 @@ impl SolarCalc {
 /// # Returns
 /// Day length in seconds, or None if either event is missing
 pub fn day_length(sr: &Option<SunEvent>, ss: &Option<SunEvent>) -> Option<i64> {
-    Some((ss.as_ref()?.0 - sr.as_ref()?.0).num_seconds())
+    Some(ss.as_ref()?.0.duration_since(&sr.as_ref()?.0).as_secs())
 }
 
 /// Position of `t` on the local clock face, in seconds from 00:00 of `day`.
@@ -474,9 +502,12 @@ pub fn day_length(sr: &Option<SunEvent>, ss: &Option<SunEvent>) -> Option<i64> {
 /// clock on the wall would show. Events landing on a neighbouring calendar day
 /// are carried by whole days, giving values outside `0..86_400` — see
 /// [`ExtremeEvent::clock_seconds`].
-fn clock_seconds(t: DateTime<Tz>, day: NaiveDate) -> i64 {
-    let day_shift = (t.date_naive() - day).num_days();
-    day_shift * 86_400 + i64::from(t.num_seconds_from_midnight())
+fn clock_seconds(t: &ZonedDateTime, day: Date) -> i64 {
+    let day_shift_secs = t.date().duration_since(day).as_secs();
+    let time = t.time();
+    let secs_from_midnight =
+        i64::from(time.hour()) * 3600 + i64::from(time.minute()) * 60 + i64::from(time.second());
+    day_shift_secs + secs_from_midnight
 }
 
 /// Keep `cand` if it is earlier on the clock than what `slot` already holds.
@@ -514,15 +545,23 @@ mod tests {
     use super::*;
     use crate::SOLAR_RADIUS_DEG;
     use crate::geo::horizon_dip_deg;
-    use chrono::TimeZone;
-    use chrono_tz::Europe::Helsinki;
-    use chrono_tz::UTC;
+    use jiff::civil::date;
+    use jiff::tz::AmbiguousOffset;
     use solar_positioning::delta_t;
+
+    fn tz(name: &str) -> TimeZone {
+        TimeZone::get(name).unwrap()
+    }
+
+    fn secs_from_midnight(z: &ZonedDateTime) -> i64 {
+        let t = z.time();
+        i64::from(t.hour()) * 3600 + i64::from(t.minute()) * 60 + i64::from(t.second())
+    }
 
     #[test]
     fn test_dead_sea_sunrise_shift() {
-        let tz = Helsinki;
-        let date = tz.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let helsinki = tz("Europe/Helsinki");
+        let dt = helsinki.to_zoned_datetime(date(2025, 7, 1).at(0, 0, 0, 0)).unwrap();
         let lat = 31.0;
         let lon = 35.4;
 
@@ -541,7 +580,7 @@ mod tests {
             target: base_alt - horizon_dip_deg(lat, 0.0),
         };
 
-        let noon0_res = calc0.get_transit(date).unwrap();
+        let noon0_res = calc0.get_transit(&dt).unwrap();
         let noon0 = calc0.extract_transit_time(&noon0_res);
         let (sr0, _) = calc0.solve_from_noon(noon0).unwrap();
         let sr0 = sr0.unwrap().0;
@@ -559,11 +598,11 @@ mod tests {
         let (sr_ds, _) = calc_ds.solve_from_noon(noon0).unwrap();
         let sr_ds = sr_ds.unwrap().0;
 
-        let shift = (sr_ds - sr0).num_seconds();
+        let shift = sr_ds.duration_since(&sr0).as_secs();
 
         // NOAA + JPL both show ~3–5 minutes later sunrise
         assert!(
-            shift >= 180 && shift <= 300,
+            (180..=300).contains(&shift),
             "Dead Sea sunrise shift out of expected range: {} s",
             shift
         );
@@ -571,13 +610,13 @@ mod tests {
 
     #[test]
     fn test_civil_twilight_ignores_horizon_dip() {
-        let tz = Helsinki;
+        let helsinki = tz("Europe/Helsinki");
         let lat = 31.0;
         let lon = 35.4;
         let delta_t = delta_t::estimate_from_date(2025, 7).unwrap();
         let refraction = Some(RefractionCorrection::standard());
 
-        let date = tz.with_ymd_and_hms(2025, 7, 1, 0, 0, 0).unwrap();
+        let dt = helsinki.to_zoned_datetime(date(2025, 7, 1).at(0, 0, 0, 0)).unwrap();
 
         // Civil twilight altitude
         let target_alt = -6.0;
@@ -585,10 +624,10 @@ mod tests {
         // Get solar noon (same for both)
         let location = Location { latitude: lat, longitude: lon };
         let day_events = SolarEvents::new()
-            .for_date(date.date_naive(), &tz, location, delta_t, Horizon::CivilTwilight)
+            .for_date(dt.date(), &helsinki, location, delta_t, Horizon::CivilTwilight)
             .unwrap();
 
-        let noon = *day_events.transits.first().expect("Expected civil twilight on this date");
+        let noon = day_events.transits.first().expect("Expected civil twilight on this date");
 
         // Low altitude observer
         let calc_low =
@@ -602,7 +641,7 @@ mod tests {
         let (tw_high, _) = calc_high.solve_from_noon(noon).unwrap();
         let tw_high = tw_high.unwrap().0;
 
-        let diff = (tw_high - tw_low).num_seconds().abs();
+        let diff = tw_high.duration_since(&tw_low).as_secs().abs();
 
         // Twilight must not shift with altitude
         assert!(diff <= 1, "Civil twilight shifted by {} seconds due to altitude", diff);
@@ -610,9 +649,7 @@ mod tests {
 
     #[test]
     fn test_midnight_sun_exists_in_may_tromso() {
-        use chrono_tz::Europe::Oslo;
-
-        let tz = Oslo;
+        let oslo = tz("Europe/Oslo");
         let lat = 69.6492;
         let lon = 18.9553;
         let delta_t = delta_t::estimate_from_date(2025, 5).unwrap();
@@ -623,11 +660,10 @@ mod tests {
 
         // Scan a safe window
         for day in 15..25 {
-            let date = tz.with_ymd_and_hms(2025, 5, day, 0, 0, 0).unwrap();
+            let d = date(2025, 5, day);
 
-            let day_events = calculator
-                .for_date(date.date_naive(), &tz, location, delta_t, Horizon::SunriseSunset)
-                .unwrap();
+            let day_events =
+                calculator.for_date(d, &oslo, location, delta_t, Horizon::SunriseSunset).unwrap();
 
             if day_events.always_above() {
                 found_midnight_sun = true;
@@ -640,28 +676,33 @@ mod tests {
 
     #[test]
     fn test_equator_never_has_polar_night() {
-        let tz = UTC;
+        let utc = TimeZone::UTC;
         let lat = 0.0;
         let lon = 0.0;
-        let year = 2025;
+        let year: i16 = 2025;
 
         let refraction = Some(RefractionCorrection::standard());
         let target_alt = -SOLAR_RADIUS_DEG;
 
-        for month in 1..=12 {
-            for day in 1..=31 {
-                // Skip invalid dates safely
-                let date = match tz.with_ymd_and_hms(year, month, day, 0, 0, 0) {
-                    chrono::LocalResult::Single(d) => d,
-                    _ => continue, // Invalid or ambiguous date (DST etc.)
+        for month in 1..=12i8 {
+            for day in 1..=31i8 {
+                let Ok(d) = Date::new(year, month, day) else {
+                    continue;
                 };
+                let amb = utc.to_ambiguous_zoned_datetime(d.at(0, 0, 0, 0));
+                if !matches!(amb.offset(), AmbiguousOffset::Unambiguous { .. }) {
+                    continue;
+                }
+                let dt = amb.unambiguous().unwrap();
 
-                let delta_t = delta_t::estimate_from_date(year, month).unwrap();
+                let delta_t =
+                    delta_t::estimate_from_date(i32::from(year), u32::try_from(month).unwrap())
+                        .unwrap();
 
                 let calc =
                     SolarCalc { lat, lon, alt: 0.0, delta_t, refr: refraction, target: target_alt };
 
-                let noon_res = calc.get_transit(date).expect("Failed to get transit at equator");
+                let noon_res = calc.get_transit(&dt).expect("Failed to get transit at equator");
                 let noon = calc.extract_transit_time(&noon_res);
 
                 let (sr, ss) = calc.solve_from_noon(noon).expect("SPA failed at equator");
@@ -669,7 +710,7 @@ mod tests {
                 assert!(
                     sr.is_some() && ss.is_some(),
                     "Missing sunrise/sunset at equator on {}",
-                    date.date_naive()
+                    dt.date()
                 );
             }
         }
@@ -683,12 +724,12 @@ mod tests {
         let target_alt = -SOLAR_RADIUS_DEG;
 
         // ΔT model is valid from year -500 onward
-        let years = [-500, -200, 0, 500, 1000, 1800, 1900, 2000, 2001, 2100, 3000, 5000];
+        let years: [i16; 12] = [-500, -200, 0, 500, 1000, 1800, 1900, 2000, 2001, 2100, 3000, 5000];
 
         for &year in &years {
-            let date = UTC.with_ymd_and_hms(year, 6, 21, 0, 0, 0).unwrap();
+            let dt = TimeZone::UTC.to_zoned_datetime(date(year, 6, 21).at(0, 0, 0, 0)).unwrap();
 
-            let delta_t = match delta_t::estimate_from_date(year, 6) {
+            let delta_t = match delta_t::estimate_from_date(i32::from(year), 6) {
                 Ok(dt) => dt,
                 Err(_) => continue, // Explicitly respect ΔT limits
             };
@@ -696,7 +737,7 @@ mod tests {
             let calc =
                 SolarCalc { lat, lon, alt: 0.0, delta_t, refr: refraction, target: target_alt };
 
-            let noon_res = match calc.get_transit(date) {
+            let noon_res = match calc.get_transit(&dt) {
                 Some(n) => n,
                 None => continue,
             };
@@ -710,7 +751,7 @@ mod tests {
             let sr = sr.unwrap().0;
             let ss = ss.unwrap().0;
 
-            let day_len = (ss - sr).num_seconds();
+            let day_len = ss.duration_since(&sr).as_secs();
 
             assert!(day_len > 0);
             assert!(day_len < 24 * 3600);
@@ -732,19 +773,20 @@ mod tests {
 
     #[test]
     fn test_yearly_extremes_straddle_the_solstices() {
+        let helsinki = tz("Europe/Helsinki");
         let lat = 60.4;
         let lon = 25.1;
-        let ex = extremes_calc(lat, lon, 2025).yearly_extremes(Helsinki, 2025).unwrap();
+        let ex = extremes_calc(lat, lon, 2025).yearly_extremes(&helsinki, 2025).unwrap();
 
         // Southern Finland: every day of the year has both events.
         assert_eq!(ex.days_scanned, 365);
         assert_eq!(ex.days_with_sunrise, 365);
         assert_eq!(ex.days_with_sunset, 365);
 
-        let er = ex.earliest_sunrise.unwrap().time;
-        let ls = ex.latest_sunset.unwrap().time;
-        let lr = ex.latest_sunrise.unwrap().time;
-        let es = ex.earliest_sunset.unwrap().time;
+        let er = ex.earliest_sunrise.as_ref().unwrap().time.clone();
+        let ls = ex.latest_sunset.as_ref().unwrap().time.clone();
+        let lr = ex.latest_sunrise.as_ref().unwrap().time.clone();
+        let es = ex.earliest_sunset.as_ref().unwrap().time.clone();
 
         // The equation of time makes the four extremes straddle the solstices
         // instead of landing on them: the earliest sunrise comes days before
@@ -766,27 +808,31 @@ mod tests {
         // Sanity: the extremes are ordered on the clock, and at this latitude
         // no event crosses midnight, so the ranking key is exactly the
         // wall-clock reading.
-        let (er_key, lr_key) =
-            (ex.earliest_sunrise.unwrap().clock_seconds, ex.latest_sunrise.unwrap().clock_seconds);
-        let (es_key, ls_key) =
-            (ex.earliest_sunset.unwrap().clock_seconds, ex.latest_sunset.unwrap().clock_seconds);
+        let (er_key, lr_key) = (
+            ex.earliest_sunrise.as_ref().unwrap().clock_seconds,
+            ex.latest_sunrise.as_ref().unwrap().clock_seconds,
+        );
+        let (es_key, ls_key) = (
+            ex.earliest_sunset.as_ref().unwrap().clock_seconds,
+            ex.latest_sunset.as_ref().unwrap().clock_seconds,
+        );
 
         assert!(er_key < lr_key);
         assert!(es_key < ls_key);
-        assert_eq!(er_key, i64::from(er.num_seconds_from_midnight()));
-        assert_eq!(ls_key, i64::from(ls.num_seconds_from_midnight()));
+        assert_eq!(er_key, secs_from_midnight(&er));
+        assert_eq!(ls_key, secs_from_midnight(&ls));
     }
 
     #[test]
     fn test_yearly_extremes_southern_hemisphere() {
-        use chrono_tz::Australia::Sydney;
+        let sydney = tz("Australia/Sydney");
 
-        let ex = extremes_calc(-33.87, 151.21, 2025).yearly_extremes(Sydney, 2025).unwrap();
+        let ex = extremes_calc(-33.87, 151.21, 2025).yearly_extremes(&sydney, 2025).unwrap();
 
-        let er = ex.earliest_sunrise.unwrap().time;
-        let ls = ex.latest_sunset.unwrap().time;
-        let lr = ex.latest_sunrise.unwrap().time;
-        let es = ex.earliest_sunset.unwrap().time;
+        let er = &ex.earliest_sunrise.as_ref().unwrap().time;
+        let ls = &ex.latest_sunset.as_ref().unwrap().time;
+        let lr = &ex.latest_sunrise.as_ref().unwrap().time;
+        let es = &ex.earliest_sunset.as_ref().unwrap().time;
 
         // Sunsets follow the seasons, flipped: the summer maximum spills past
         // New Year — the scan is a calendar year, so it lands in early January
@@ -828,10 +874,10 @@ mod tests {
 
     #[test]
     fn test_yearly_extremes_polar_gaps_are_skipped() {
-        use chrono_tz::Europe::Oslo;
+        let oslo = tz("Europe/Oslo");
 
         // Tromsø: polar night around midwinter, midnight sun around midsummer.
-        let ex = extremes_calc(69.6492, 18.9553, 2025).yearly_extremes(Oslo, 2025).unwrap();
+        let ex = extremes_calc(69.6492, 18.9553, 2025).yearly_extremes(&oslo, 2025).unwrap();
 
         assert_eq!(ex.days_scanned, 365);
         assert!(
@@ -853,21 +899,21 @@ mod tests {
 
     #[test]
     fn test_clock_seconds_carries_across_midnight() {
-        use chrono::NaiveDate;
-
-        let day = NaiveDate::from_ymd_opt(2025, 6, 21).unwrap();
+        let helsinki = tz("Europe/Helsinki");
+        let day = date(2025, 6, 21);
 
         // Same day: the key is the plain wall-clock reading.
-        let noon = Helsinki.with_ymd_and_hms(2025, 6, 21, 12, 0, 0).unwrap();
-        assert_eq!(clock_seconds(noon, day), 12 * 3600);
+        let noon = helsinki.to_zoned_datetime(date(2025, 6, 21).at(12, 0, 0, 0)).unwrap();
+        assert_eq!(clock_seconds(&noon, day), 12 * 3600);
 
         // Sunset spilling into the next morning stays "late", not "early".
-        let after_midnight = Helsinki.with_ymd_and_hms(2025, 6, 22, 0, 30, 0).unwrap();
-        assert_eq!(clock_seconds(after_midnight, day), 24 * 3600 + 30 * 60);
+        let after_midnight = helsinki.to_zoned_datetime(date(2025, 6, 22).at(0, 30, 0, 0)).unwrap();
+        assert_eq!(clock_seconds(&after_midnight, day), 24 * 3600 + 30 * 60);
 
         // Sunrise on the previous evening stays "early", not "late".
-        let before_midnight = Helsinki.with_ymd_and_hms(2025, 6, 20, 23, 50, 0).unwrap();
-        assert_eq!(clock_seconds(before_midnight, day), -10 * 60);
+        let before_midnight =
+            helsinki.to_zoned_datetime(date(2025, 6, 20).at(23, 50, 0, 0)).unwrap();
+        assert_eq!(clock_seconds(&before_midnight, day), -10 * 60);
     }
 
     // regression for suncalc #187: getTimes must anchor to the local solar day containing the input instant.
@@ -875,10 +921,7 @@ mod tests {
     // input landed within minutes of that UTC boundary — the local solar day is ~12 h out of phase there.
     #[test]
     fn test_get_times_resolves_the_anchored_solar_day_at_every_longitude() {
-        // regression for #187: getTimes must anchor to the local solar day containing the input instant.
-        // Rounding to the nearest UTC noon first put antimeridian longitudes a full day off whenever the
-        // input landed within minutes of that UTC boundary — the local solar day is ~12 h out of phase there.
-        let day = UTC.with_ymd_and_hms(2026, 8, 19, 12, 0, 0).unwrap();
+        let day = TimeZone::UTC.to_zoned_datetime(date(2026, 8, 19).at(12, 0, 0, 0)).unwrap();
         let lat: f64 = 40.0;
         let hour_ms: f64 = 3_600_000.0;
 
@@ -891,7 +934,7 @@ mod tests {
 
         for &lng in &longitudes {
             let offset_ms = ((lng / 15.0) * hour_ms).round() as i64;
-            let anchor = day - chrono::Duration::milliseconds(offset_ms); // that longitude's own local solar noon
+            let anchor = day.checked_sub(SignedDuration::from_millis(offset_ms)).unwrap();
 
             let calc = SolarCalc {
                 lat,
@@ -903,11 +946,11 @@ mod tests {
             };
 
             let noon_res = calc
-                .get_transit(anchor)
+                .get_transit(&anchor)
                 .unwrap_or_else(|| panic!("failed to calculate transit for lng {lng}"));
             let solar_noon = calc.extract_transit_time(&noon_res);
 
-            let off = (solar_noon - anchor).num_milliseconds() as f64 / hour_ms;
+            let off = solar_noon.duration_since(&anchor).as_secs_f64() / 3600.0;
 
             assert!(off.abs() < 1.0, "lng {lng}: solarNoon {off:.2} h from local solar noon");
         }

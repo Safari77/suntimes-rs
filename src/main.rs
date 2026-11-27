@@ -1,7 +1,8 @@
 use crate::solar::SunriseResult;
-use chrono::{DateTime, Datelike, Duration, TimeZone, Utc};
-use chrono_tz::Tz;
 use clap::Parser;
+use jiff::civil::{Date, Time};
+use jiff::tz::{AmbiguousOffset, TimeZone};
+use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 use parse_datetime::{ParsedDateTime, parse_datetime_at_date};
 use solar_positioning::{RefractionCorrection, delta_t};
 
@@ -20,41 +21,16 @@ use geo::{SOLAR_RADIUS_DEG, horizon_dip_deg};
 use solar::{SolarCalc, day_length};
 use time::{parse_time_ns, resolve_timezone, system_timezone};
 
-fn parse_relative_to_chrono<Tz>(anchor: &DateTime<Tz>, input: &str) -> Result<DateTime<Tz>, String>
-where
-    Tz: TimeZone + std::fmt::Display,
-    Tz::Offset: std::fmt::Display,
-{
-    // 1. Convert Chrono Anchor -> Jiff Anchor
-    let tz_name = anchor.timezone().to_string();
-
-    let jiff_tz = jiff::tz::TimeZone::get(&tz_name)
-        .map_err(|e| format!("Jiff failed to load tz '{}': {}", tz_name, e))?;
-
-    let jiff_anchor: jiff::ZonedDateTime =
-        jiff::Timestamp::new(anchor.timestamp(), anchor.timestamp_subsec_nanos() as i32)
-            .map_err(|e| format!("Timestamp conversion failed: {}", e))?
-            .to_zoned_datetime(jiff_tz);
-
-    let parsed_jiff = parse_datetime_at_date(jiff_anchor, input)
+fn parse_relative_date(anchor: &ZonedDateTime, input: &str) -> Result<ZonedDateTime, String> {
+    let parsed = parse_datetime_at_date(anchor.clone(), input)
         .map_err(|e| format!("Failed to parse '{}': {}", input, e))?;
 
-    // Extract the valid jiff::Zoned object from the v0.15 enum
-    let jiff_zoned = match parsed_jiff {
-        ParsedDateTime::InRange(z) => z,
+    match parsed {
+        ParsedDateTime::InRange(z) => Ok(z.with_time_zone(anchor.time_zone().clone())),
         ParsedDateTime::Extended(ext) => {
-            return Err(format!("Parsed date exceeds standard limits: year {}", ext.year));
+            Err(format!("Parsed date exceeds standard limits: year {}", ext.year))
         }
-    };
-
-    // Convert Jiff Result -> Chrono
-    let ts = jiff_zoned.timestamp();
-    let dt_utc = Utc
-        .timestamp_opt(ts.as_second(), ts.subsec_nanosecond() as u32)
-        .single()
-        .ok_or("Resulting timestamp is invalid in Chrono")?;
-
-    Ok(dt_utc.with_timezone(&anchor.timezone()))
+    }
 }
 
 // ===================== MAIN =====================
@@ -85,24 +61,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let use_argos = args.argos && !args.no_argos;
 
     let tz = if args.utc {
-        Tz::UTC
+        TimeZone::UTC
     } else {
         match args.timezone.as_str() {
             "system" => system_timezone(),
             "location" => resolve_timezone(args.longitude.value, args.latitude.value),
-            other => other.parse().unwrap_or(Tz::UTC),
+            other => TimeZone::get(other).unwrap_or(TimeZone::UTC),
         }
     };
-    let now_dt =
-        if args.utc { Utc::now().with_timezone(&Tz::UTC) } else { Utc::now().with_timezone(&tz) };
+    let now_dt = Timestamp::now().to_zoned_datetime(tz.clone());
 
     // Anchor 'today' to the target timezone
-    let anchor_time = Utc::now().with_timezone(&tz);
-    let date = if let Some(s) = &args.date {
-        parse_relative_to_chrono(&anchor_time, s)?
-    } else {
-        anchor_time
-    };
+    let date =
+        if let Some(s) = &args.date { parse_relative_date(&now_dt, s)? } else { now_dt.clone() };
 
     let base_alt = if args.civil {
         -6.0
@@ -117,10 +88,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Helper to find the "Logical Midnight" (Start of Day) safely.
     // Returns the first valid time on that day (00:00, or 01:00 if a DST gap
     // skipped midnight, or `date` if neither exists).
-    let find_start_of_day =
-        |d: chrono::NaiveDate| -> DateTime<Tz> { time::start_of_day(tz, d, date) };
+    let find_start_of_day = |d: Date| -> ZonedDateTime { time::start_of_day(&tz, d, &date) };
 
-    let delta_t: f64 = delta_t::estimate_from_date(date.year(), date.month())?;
+    let year_i32 = i32::from(date.year());
+    let month = u32::try_from(date.month())?;
+    let delta_t: f64 = delta_t::estimate_from_date(year_i32, month)?;
 
     // Fetch air quality / pollen / elevation if any of the relevant
     // flags is active. The fetch is cached on disk for an hour, so
@@ -204,14 +176,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let transit_res = calc.get_transit(date).ok_or("Failed to compute solar transit")?;
+    let transit_res = calc.get_transit(&date).ok_or("Failed to compute solar transit")?;
     let transit = calc.extract_transit_time(&transit_res);
 
     // Get current sun position (only used for Argos or --at "now", but cheap to compute)
-    let now_pos = calc.position(now_dt)?;
+    let now_pos = calc.position(now_dt.timestamp())?;
 
     // Get sun position at solar noon (max altitude)
-    let transit_pos = calc.position(transit)?;
+    let transit_pos = calc.position(transit.timestamp())?;
 
     let (sr, ss) = calc.solve_from_noon(transit)?;
 
@@ -219,17 +191,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let len_today = day_length(&sr, &ss);
 
     let mut len_tomorrow = None;
-    let mut check_date = date.date_naive().succ_opt();
+    let mut check_date = date.date().tomorrow().ok();
     // Look ahead up to 2 days to handle day skips
     for _ in 0..2 {
         if let Some(d) = check_date {
             // Find the first valid local instant on this calendar day.
-            // `start_of_day_opt` also correctly handles DST fall-back (`01:00` ambiguous),
-            // whereas the previous inline code used `.single()` which discarded that case.
-            let tomorrow_dt = time::start_of_day_opt(tz, d);
+            // `start_of_day_opt` also correctly handles DST fall-back (`01:00` ambiguous).
+            let tomorrow_dt = time::start_of_day_opt(&tz, d);
 
             if let Some(t_dt) = tomorrow_dt
-                && let Some(transit2_res) = calc.get_transit(t_dt)
+                && let Some(transit2_res) = calc.get_transit(&t_dt)
             {
                 let transit2 = calc.extract_transit_time(&transit2_res);
                 let (sr2, ss2) = calc.solve_from_noon(transit2)?;
@@ -237,7 +208,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break; // Found a valid day!
             }
             // If we reach here, the day didn't exist (Samoa skip), try the day after
-            check_date = d.succ_opt();
+            check_date = d.tomorrow().ok();
         }
     }
 
@@ -261,37 +232,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config
     });
 
-    let day_of_year = date.ordinal();
-    // Construct the full NaiveDateTime first, then resolve timezone once.
-    let target_dt: Option<DateTime<Tz>> = if let Some(at) = args.at.as_deref() {
+    let day_of_year = u32::try_from(date.day_of_year())?;
+    // Construct the full civil DateTime first, then resolve timezone once.
+    let target_dt: Option<ZonedDateTime> = if let Some(at) = args.at.as_deref() {
         if at == "now" {
-            Some(if args.utc {
-                Utc::now().with_timezone(&Tz::UTC)
-            } else {
-                Utc::now().with_timezone(&tz)
-            })
+            Some(Timestamp::now().to_zoned_datetime(tz.clone()))
         } else {
             let (h, m, s, ns) = parse_time_ns(at)?;
 
-            // 1. Construct the full naive time including nanoseconds
-            let naive_dt =
-                date.date_naive().and_hms_nano_opt(h, m, s, ns).ok_or("Invalid time digits")?;
+            // 1. Construct the full civil time including nanoseconds
+            let civil_time =
+                Time::new(i8::try_from(h)?, i8::try_from(m)?, i8::try_from(s)?, i32::try_from(ns)?)
+                    .map_err(|_| "Invalid time digits")?;
+            let local_dt = date.date().to_datetime(civil_time);
 
             // 2. Resolve against timezone exactly once
-            match tz.from_local_datetime(&naive_dt) {
-                chrono::LocalResult::Single(t) => Some(t),
-                chrono::LocalResult::Ambiguous(t1, t2) => {
+            let amb = tz.to_ambiguous_zoned_datetime(local_dt);
+            match amb.offset() {
+                AmbiguousOffset::Unambiguous { .. } => Some(amb.unambiguous()?),
+                AmbiguousOffset::Fold { .. } => {
                     // Handle Fall Back (e.g. 03:00 happens twice).
-                    // t1 is usually the earlier instant (Daylight time), t2 is Standard time.
+                    // t1 is the earlier instant (Daylight time), t2 is Standard time.
+                    let t1 = amb.clone().earlier()?;
+                    let t2 = amb.later()?;
                     eprintln!(
                         "Note: Time {} is ambiguous (DST transition). Using early option: {} (vs {})",
                         at,
-                        t1.format("%H:%M:%S %Z"),
-                        t2.format("%H:%M:%S %Z")
+                        t1.strftime("%H:%M:%S %Z"),
+                        t2.strftime("%H:%M:%S %Z")
                     );
                     Some(t1)
                 }
-                chrono::LocalResult::None => {
+                AmbiguousOffset::Gap { .. } => {
                     // Handle Spring Forward (e.g. 02:30 doesn't exist).
                     // Return the error through the normal `?` path so any
                     // cleanup / destructors in main's scope get to run, rather
@@ -299,7 +271,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     return Err(format!(
                         "The time {} does not exist on {} (DST gap/Spring Forward).",
                         at,
-                        date.date_naive()
+                        date.date()
                     )
                     .into());
                 }
@@ -310,11 +282,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Determine which position to use for the "Current Conditions" solar panel output
-    let (panel_output_pos, panel_output_label) = if let Some(dt) = target_dt {
-        (calc.position(dt)?, format!("at {}", dt.format("%H:%M:%S")))
+    let (panel_output_pos, panel_output_label) = if let Some(ref dt) = target_dt {
+        (calc.position(dt.timestamp())?, format!("at {}", dt.strftime("%H:%M:%S")))
     } else if args.date.is_some() {
         // If user set a date but no time, default to Solar Noon for that day
-        (transit_pos, format!("at solar noon ({})", transit.format("%H:%M:%S")))
+        (transit_pos, format!("at solar noon ({})", transit.strftime("%H:%M:%S")))
     } else {
         // Default to now
         (now_pos, "now".to_string())
@@ -331,7 +303,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 1. Current UV (at target time)
-    let month = date.month();
 
     // Online aerosol optical depth feed for the UV calculation. The fetched
     // value is a 550 nm total-column AOD (CAMS, via --aqi); uv.rs converts it
@@ -394,49 +365,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Calculate sun positions for the day (used by both daily energy and optimization)
     let sun_positions: Option<Vec<(f64, f64, f64)>> = {
-        // 1. Determine integration window (start_dt, end_dt)
-        let (start_dt, end_dt) = match transit_res {
+        // 1. Determine integration window (start_ts, end_ts)
+        let (start_ts, end_ts) = match transit_res {
             SunriseResult::RegularDay { .. } => match (&sr, &ss) {
-                (Some((sr_t, _)), Some((ss_t, _))) => (*sr_t, *ss_t),
-                _ => (date, date),
+                (Some((sr_t, _)), Some((ss_t, _))) => (sr_t.timestamp(), ss_t.timestamp()),
+                _ => (date.timestamp(), date.timestamp()),
             },
             SunriseResult::AllDay { .. } => {
-                let start = find_start_of_day(date.date_naive());
-                (start, start + Duration::hours(24))
+                let start = find_start_of_day(date.date()).timestamp();
+                (start, start + SignedDuration::from_hours(24))
             }
-            SunriseResult::AllNight { .. } => (date, date),
+            SunriseResult::AllNight { .. } => (date.timestamp(), date.timestamp()),
         };
 
-        if start_dt == end_dt {
+        if start_ts == end_ts {
             None
         } else {
             // 2. Determine "Midnight Reference" for X-axis calculation
-            let midnight_ref = find_start_of_day(date.date_naive());
+            let midnight_ts = find_start_of_day(date.date()).timestamp();
 
-            let step = Duration::minutes(1);
+            let step = SignedDuration::from_mins(1);
             let mut positions: Vec<(f64, f64, f64)> = Vec::new();
-            let mut current_time = start_dt;
+            let mut current_ts = start_ts;
 
-            // Loop until strictly before end_dt
-            while current_time < end_dt {
-                let pos = calc.position(current_time)?;
+            // Loop until strictly before end_ts
+            while current_ts < end_ts {
+                let pos = calc.position(current_ts)?;
 
                 // Calculate hours from midnight reference
-                let duration_from_midnight = current_time.signed_duration_since(midnight_ref);
-                let hours_relative = duration_from_midnight.num_seconds() as f64 / 3600.0;
+                let duration_from_midnight = current_ts.duration_since(midnight_ts);
+                let hours_relative = duration_from_midnight.as_secs() as f64 / 3600.0;
 
                 // Normalize hours (0..24 range)
                 let hours_normalized =
                     if hours_relative < 0.0 { hours_relative + 24.0 } else { hours_relative };
 
                 positions.push((hours_normalized, pos.elevation_angle(), pos.azimuth()));
-                current_time += step;
+                current_ts += step;
             }
 
             // Always add the exact end point (Sunset or 24:00)
-            let pos_end = calc.position(end_dt)?;
-            let duration_end = end_dt.signed_duration_since(midnight_ref);
-            let hours_end = duration_end.num_seconds() as f64 / 3600.0;
+            let pos_end = calc.position(end_ts)?;
+            let duration_end = end_ts.duration_since(midnight_ts);
+            let hours_end = duration_end.as_secs() as f64 / 3600.0;
             let hours_end_norm = if hours_end < 0.0 { hours_end + 24.0 } else { hours_end };
 
             positions.push((hours_end_norm, pos_end.elevation_angle(), pos_end.azimuth()));
@@ -513,98 +484,96 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Create the sun position generator closure
         // We need to move all values into the closure
         let calc_clone = calc;
-        let tz_clone = tz;
-        let year = date.year();
+        let tz_clone = tz.clone();
+        let year = year_i32;
+        let year_i16 = date.year();
 
         let sun_pos_generator: optimize::SunPositionGenerator =
             Box::new(move |_lat, _lon, _alt, day_of_year| {
-                let find_start_of_day =
-                    |d: chrono::NaiveDate, fallback_dt: DateTime<Tz>| -> DateTime<Tz> {
-                        time::start_of_day(tz_clone, d, fallback_dt)
-                    };
-
-                // Convert day_of_year to a date
-                let target_date = chrono::NaiveDate::from_yo_opt(year, day_of_year)
-                    .unwrap_or_else(|| chrono::NaiveDate::from_yo_opt(year, 1).unwrap());
-
-                // Get solar transit for this day
-                let day_dt = match tz_clone
-                    .from_local_datetime(&target_date.and_hms_opt(12, 0, 0).unwrap())
-                {
-                    chrono::LocalResult::Single(t) => t,
-                    chrono::LocalResult::Ambiguous(t, _) => t,
-                    chrono::LocalResult::None => {
-                        match tz_clone
-                            .from_local_datetime(&target_date.and_hms_opt(13, 0, 0).unwrap())
-                        {
-                            chrono::LocalResult::Single(t) => t,
-                            chrono::LocalResult::Ambiguous(t, _) => t,
-                            chrono::LocalResult::None => {
-                                // Fallback: use UTC for this day
-                                let naive = target_date.and_hms_opt(12, 0, 0).unwrap();
-                                DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc)
-                                    .with_timezone(&tz_clone)
-                            }
-                        }
-                    }
+                let find_start_of_day = |d: Date, fallback_dt: &ZonedDateTime| -> ZonedDateTime {
+                    time::start_of_day(&tz_clone, d, fallback_dt)
                 };
 
-                // Get transit for this day
-                let transit_res = calc_clone.get_transit(day_dt);
-                if transit_res.is_none() {
-                    return Vec::new();
-                }
+                // Convert day_of_year to a date
+                let jan_first = Date::new(year_i16, 1, 1).expect("Jan 1 of a valid Jiff year");
+                let target_date = i16::try_from(day_of_year)
+                    .ok()
+                    .and_then(|d| jan_first.with().day_of_year(d).build().ok())
+                    .unwrap_or(jan_first);
 
-                let transit = calc_clone.extract_transit_time(&transit_res.unwrap());
+                // Get solar transit for this day: prefer 12:00 local, then 13:00, then UTC noon
+                let day_dt = time::noon_of_day_opt(&tz_clone, target_date)
+                    .or_else(|| {
+                        let amb = tz_clone.to_ambiguous_zoned_datetime(target_date.at(13, 0, 0, 0));
+                        match amb.offset() {
+                            AmbiguousOffset::Unambiguous { .. } | AmbiguousOffset::Fold { .. } => {
+                                amb.earlier().ok()
+                            }
+                            AmbiguousOffset::Gap { .. } => None,
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        TimeZone::UTC
+                            .to_zoned_datetime(target_date.at(12, 0, 0, 0))
+                            .expect("UTC noon is always unambiguous")
+                            .with_time_zone(tz_clone.clone())
+                    });
+
+                // Get transit for this day
+                let Some(transit_res) = calc_clone.get_transit(&day_dt) else {
+                    return Vec::new();
+                };
+
+                let transit = calc_clone.extract_transit_time(&transit_res);
                 let (sr, ss) = match calc_clone.solve_from_noon(transit) {
                     Ok(pair) => pair,
                     Err(_) => return Vec::new(),
                 };
 
                 // Determine start and end times
-                let (start_dt, end_dt) = match (&sr, &ss) {
-                    (Some((sr_t, _)), Some((ss_t, _))) => (*sr_t, *ss_t),
+                let (start_ts, end_ts) = match (&sr, &ss) {
+                    (Some((sr_t, _)), Some((ss_t, _))) => (sr_t.timestamp(), ss_t.timestamp()),
                     _ => {
                         // Polar day/night handling
-                        let start = find_start_of_day(target_date, day_dt);
-                        (start, start + Duration::hours(24))
+                        let start = find_start_of_day(target_date, &day_dt).timestamp();
+                        (start, start + SignedDuration::from_hours(24))
                     }
                 };
 
-                if start_dt >= end_dt {
+                if start_ts >= end_ts {
                     return Vec::new();
                 }
 
                 // Midnight reference for this day
-                let midnight_ref = find_start_of_day(target_date, day_dt);
+                let midnight_ts = find_start_of_day(target_date, &day_dt).timestamp();
 
-                let step = Duration::minutes(10); // Use 10-minute steps for efficiency
+                let step = SignedDuration::from_mins(10); // Use 10-minute steps for efficiency
                 let mut positions: Vec<(f64, f64, f64)> = Vec::new();
-                let mut current_time = start_dt;
+                let mut current_ts = start_ts;
 
-                while current_time < end_dt {
+                while current_ts < end_ts {
                     // On SPA failure we abort this day and return what we have so
                     // far; yearly optimization sums over sampled days, so a single
                     // truncated/empty day only locally reduces accuracy.
-                    let pos = match calc_clone.position(current_time) {
+                    let pos = match calc_clone.position(current_ts) {
                         Ok(p) => p,
                         Err(_) => return positions,
                     };
-                    let duration_from_midnight = current_time.signed_duration_since(midnight_ref);
-                    let hours_relative = duration_from_midnight.num_seconds() as f64 / 3600.0;
+                    let duration_from_midnight = current_ts.duration_since(midnight_ts);
+                    let hours_relative = duration_from_midnight.as_secs() as f64 / 3600.0;
                     let hours_normalized =
                         if hours_relative < 0.0 { hours_relative + 24.0 } else { hours_relative };
                     positions.push((hours_normalized, pos.elevation_angle(), pos.azimuth()));
-                    current_time += step;
+                    current_ts += step;
                 }
 
                 // Add endpoint
-                let pos_end = match calc_clone.position(end_dt) {
+                let pos_end = match calc_clone.position(end_ts) {
                     Ok(p) => p,
                     Err(_) => return positions,
                 };
-                let duration_end = end_dt.signed_duration_since(midnight_ref);
-                let hours_end = duration_end.num_seconds() as f64 / 3600.0;
+                let duration_end = end_ts.duration_since(midnight_ts);
+                let hours_end = duration_end.as_secs() as f64 / 3600.0;
                 let hours_end_norm = if hours_end < 0.0 { hours_end + 24.0 } else { hours_end };
                 positions.push((hours_end_norm, pos_end.elevation_angle(), pos_end.azimuth()));
 
@@ -668,13 +637,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Location : lat={:.6}, lon={:.6}, alt={:.1}m",
         args.latitude.value, args.longitude.value, altitude
     );
-    println!("Timezone : {}", tz);
-    println!("Date     : {}", date.date_naive());
+    println!("Timezone : {}", tz.iana_name().unwrap_or("UTC"));
+    println!("Date     : {}", date.date());
     println!("Target altitude : {:.6}°", calc.target);
     println!();
 
-    if let Some(dt) = target_dt {
-        let pos = calc.position(dt)?;
+    if let Some(ref dt) = target_dt {
+        let pos = calc.position(dt.timestamp())?;
         output::print_sun_position_at_time(dt, &pos, uv_current, uv_max);
 
         if let Some(ref config) = panel_config {
@@ -700,15 +669,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         len_today,
         len_tomorrow,
         &calc,
-        date,
+        &date,
     );
 
     // Yearly extreme sunrise/sunset times. Terminal-only by construction:
     // the Argos branch above has already returned, so this can never widen
     // the panel output.
     if args.extremes {
-        let extremes = calc.yearly_extremes(tz, date.year())?;
-        output::print_yearly_extremes(&extremes, date.year());
+        let extremes = calc.yearly_extremes(&tz, year_i32)?;
+        output::print_yearly_extremes(&extremes, year_i32);
     }
 
     if target_dt.is_none() {
@@ -731,10 +700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if args.solarpanel_horizontal_tracking {
             println!("=== Optimal HSAT Configuration ===");
-            println!(
-                "Optimized axis tilt for horizontal single-axis tracking on {}",
-                date.date_naive()
-            );
+            println!("Optimized axis tilt for horizontal single-axis tracking on {}", date.date());
             println!();
             println!("Optimal axis tilt : {:6.1}°", opt_result.tilt_deg);
             println!("Azimuth           : panel rotation tracks the sun");
@@ -757,7 +723,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else if args.solarpanel_vertical_tracking {
             println!("=== Optimal VSAT Configuration ===");
-            println!("Optimized tilt for vertical single-axis tracking on {}", date.date_naive());
+            println!("Optimized tilt for vertical single-axis tracking on {}", date.date());
             println!();
             println!("Optimal tilt    : {:6.1}°", opt_result.tilt_deg);
             println!("Azimuth         : tracks the sun");
@@ -780,7 +746,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         } else {
             println!("=== Optimal Fixed Panel Orientation ===");
-            println!("Optimized for maximum daily energy on {}", date.date_naive());
+            println!("Optimized for maximum daily energy on {}", date.date());
             println!();
 
             // Check if optimal is essentially the same as user-specified
@@ -872,7 +838,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Print yearly optimization results if requested
     if let Some((ref yearly_result, ref constraints, is_hsat)) = yearly_optimization_result {
-        output::print_yearly_optimization(yearly_result, date.year(), constraints, is_hsat);
+        output::print_yearly_optimization(yearly_result, year_i32, constraints, is_hsat);
     }
 
     Ok(())
@@ -881,41 +847,40 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
 
     #[test]
     fn test_conversion_preserves_timezone() {
         // 1. Setup: Create a time in New York (UTC-5)
         // 2023-01-01 12:00:00 UTC is 07:00:00 in New York
-        let ny_tz: chrono_tz::Tz = "America/New_York".parse().unwrap();
-        let anchor = Utc.timestamp_opt(1672574400, 0).unwrap().with_timezone(&ny_tz);
-        assert_eq!(anchor.to_string(), "2023-01-01 07:00:00 EST");
-        let result = parse_relative_to_chrono(&anchor, "tomorrow");
+        let ny_tz = TimeZone::get("America/New_York").unwrap();
+        let anchor = Timestamp::from_second(1672574400).unwrap().to_zoned_datetime(ny_tz.clone());
+        assert_eq!(anchor.strftime("%Y-%m-%d %H:%M:%S %Z").to_string(), "2023-01-01 07:00:00 EST");
+        let result = parse_relative_date(&anchor, "tomorrow");
         assert!(result.is_ok());
         let val = result.unwrap();
         // The time shifted by 1 day
-        assert_eq!(val.to_string(), "2023-01-02 07:00:00 EST");
-        // The resulting Chrono object is still in New York time, not UTC
-        assert_eq!(val.timezone(), ny_tz);
+        assert_eq!(val.strftime("%Y-%m-%d %H:%M:%S %Z").to_string(), "2023-01-02 07:00:00 EST");
+        // The resulting ZonedDateTime is still in New York time, not UTC
+        assert_eq!(val.time_zone(), &ny_tz);
     }
 
     #[test]
     fn test_handles_utc_gracefully() {
-        let anchor = Utc::now();
-        let result = parse_relative_to_chrono(&anchor, "tomorrow");
+        let anchor = Timestamp::now().to_zoned_datetime(TimeZone::UTC);
+        let result = parse_relative_date(&anchor, "tomorrow");
 
         assert!(result.is_ok());
         let val = result.unwrap();
         // Ensure it's still UTC
-        assert_eq!(val.timezone(), Utc);
+        assert_eq!(val.time_zone(), &TimeZone::UTC);
         // Ensure time moved forward
         assert!(val > anchor);
     }
 
     #[test]
     fn test_propagates_parsing_errors() {
-        let anchor = Utc::now();
-        let result = parse_relative_to_chrono(&anchor, "shallnotpass");
+        let anchor = Timestamp::now().to_zoned_datetime(TimeZone::UTC);
+        let result = parse_relative_date(&anchor, "shallnotpass");
 
         assert!(result.is_err());
         let err_msg = result.err().unwrap();

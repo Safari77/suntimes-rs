@@ -3,8 +3,8 @@
 //! Provides formatting functions for terminal and Argos (GNOME Shell) output.
 
 use crate::solar::SunriseResult;
-use chrono::{DateTime, Datelike};
-use chrono_tz::Tz;
+use jiff::ZonedDateTime;
+use jiff::civil::Date;
 
 use crate::air_quality::{self, AirQualityResponse};
 use crate::cli::AqiPollutant;
@@ -42,8 +42,8 @@ pub fn print_argos(
     now_pos: &solar_positioning::SolarPosition,
     sr: &Option<SunEvent>,
     ss: &Option<SunEvent>,
-    transit_res: &SunriseResult<DateTime<Tz>>,
-    transit: DateTime<Tz>,
+    transit_res: &SunriseResult<ZonedDateTime>,
+    transit: &ZonedDateTime,
     transit_pos: &solar_positioning::SolarPosition,
     len_today: Option<i64>,
     len_tomorrow: Option<i64>,
@@ -80,15 +80,15 @@ pub fn print_argos(
 
     // Section 2: Today's sun events
     if let Some((t, az)) = sr {
-        println!("Sunrise: {} (Az: {:.2}°)", t.format("%H:%M:%S"), az);
+        println!("Sunrise: {} (Az: {:.2}°)", t.strftime("%H:%M:%S"), az);
     }
     println!(
         "Max Altitude: {:.2}° at {}",
         transit_pos.elevation_angle(),
-        transit.format("%H:%M:%S")
+        transit.strftime("%H:%M:%S")
     );
     if let Some((t, az)) = ss {
-        println!("Sunset: {} (Az: {:.2}°)", t.format("%H:%M:%S"), az);
+        println!("Sunset: {} (Az: {:.2}°)", t.strftime("%H:%M:%S"), az);
     }
     println!("---");
 
@@ -319,24 +319,24 @@ fn print_argos_air_quality(
 pub fn print_sun_events(
     sr: &Option<SunEvent>,
     ss: &Option<SunEvent>,
-    transit_res: &SunriseResult<DateTime<Tz>>,
-    transit: DateTime<Tz>,
+    transit_res: &SunriseResult<ZonedDateTime>,
+    transit: &ZonedDateTime,
     transit_pos: &solar_positioning::SolarPosition,
     len_today: Option<i64>,
     len_tomorrow: Option<i64>,
     calc: &crate::solar::SolarCalc,
-    date: DateTime<Tz>,
+    date: &ZonedDateTime,
 ) {
     match (sr, ss) {
         (Some((t1, a1)), Some((t2, a2))) => {
-            println!("Sunrise     : {}", t1.format("%H:%M:%S %Z"));
+            println!("Sunrise     : {}", t1.strftime("%H:%M:%S %Z"));
             println!("  Azimuth   : {:8.3}°", a1);
             println!(
                 "Max Altitude: {:8.3}° at {}",
                 transit_pos.elevation_angle(),
-                transit.format("%H:%M:%S")
+                transit.strftime("%H:%M:%S")
             );
-            println!("Sunset      : {}", t2.format("%H:%M:%S %Z"));
+            println!("Sunset      : {}", t2.strftime("%H:%M:%S %Z"));
             println!("  Azimuth   : {:8.3}°", a2);
 
             if let Some(len_today) = len_today {
@@ -366,11 +366,11 @@ pub fn print_sun_events(
             println!(
                 "Max Altitude: {:8.3}° at {}",
                 transit_pos.elevation_angle(),
-                transit.format("%H:%M:%S")
+                transit.strftime("%H:%M:%S")
             );
 
             if let Ok(Some((kind, t))) = calc.find_next_event(date) {
-                println!("Next {} on {} at {}", kind, t.date_naive(), t.format("%H:%M:%S %Z"));
+                println!("Next {} on {} at {}", kind, t.date(), t.strftime("%H:%M:%S %Z"));
             }
         }
     }
@@ -424,9 +424,9 @@ fn print_extreme_line(label: &str, event: &Option<ExtremeEvent>) {
         Some(e) => println!(
             "{:<16}: {} {}, {} (azimuth {:.1}°)",
             label,
-            e.time.format("%B"),
+            e.time.strftime("%B"),
             e.time.day(),
-            e.time.format("%H:%M:%S %Z"),
+            e.time.strftime("%H:%M:%S %Z"),
             e.azimuth
         ),
         None => println!("{:<16}: n/a", label),
@@ -650,12 +650,12 @@ pub fn print_solar_panel_info(
 /// * `uv_current` - Current UV index
 /// * `uv_max` - Maximum UV index for the day
 pub fn print_sun_position_at_time(
-    dt: DateTime<Tz>,
+    dt: &ZonedDateTime,
     pos: &solar_positioning::SolarPosition,
     uv_current: f64,
     uv_max: f64,
 ) {
-    println!("Sun position at {}:", dt.format("%H:%M:%S%.f %Z"));
+    println!("Sun position at {}:", dt.strftime("%H:%M:%S%.f %Z"));
     println!("  Azimuth       : {:8.3}°", pos.azimuth());
     println!("  Altitude      : {:8.3}°", pos.elevation_angle());
     println!("  Zenith angle  : {:8.3}°", pos.zenith_angle());
@@ -667,9 +667,9 @@ pub fn print_sun_position_at_time(
 /// # Arguments
 /// * `dt` - DateTime for the output
 /// * `output` - Solar panel output
-pub fn print_solar_panel_at_time(dt: DateTime<Tz>, output: &SolarPanelOutput) {
+pub fn print_solar_panel_at_time(dt: &ZonedDateTime, output: &SolarPanelOutput) {
     println!();
-    println!("Solar panel at {}:", dt.format("%H:%M:%S"));
+    println!("Solar panel at {}:", dt.strftime("%H:%M:%S"));
     println!("  Angle of inc. : {:8.2}°", output.irradiance.aoi_deg);
     println!("  POA irradiance: {}", solar_panel::format_irradiance(output.irradiance.poa));
     println!("  Power output  : {}", solar_panel::format_power(output.power_w));
@@ -687,8 +687,6 @@ pub fn print_yearly_optimization(
     constraints: &crate::optimize::OptimizationConstraints,
     is_hsat: bool,
 ) {
-    use chrono::NaiveDate;
-
     println!();
     if is_hsat {
         println!("=== Yearly HSAT Optimization (Seasonal Tilt Adjustments) ===");
@@ -741,13 +739,18 @@ pub fn print_yearly_optimization(
     );
     println!("{:-<68}", "");
 
+    let format_day_of_year = |doy: u32| -> String {
+        i16::try_from(year)
+            .ok()
+            .and_then(|y| i16::try_from(doy).ok().map(|d| (y, d)))
+            .and_then(|(y, d)| Date::new(y, 1, 1).ok()?.with().day_of_year(d).build().ok())
+            .map(|d| d.strftime("%b %d").to_string())
+            .unwrap_or_else(|| format!("Day {}", doy))
+    };
+
     for (i, period) in result.periods.iter().enumerate() {
-        let start_date = NaiveDate::from_yo_opt(year, period.start_day)
-            .map(|d| d.format("%b %d").to_string())
-            .unwrap_or_else(|| format!("Day {}", period.start_day));
-        let end_date = NaiveDate::from_yo_opt(year, period.end_day)
-            .map(|d| d.format("%b %d").to_string())
-            .unwrap_or_else(|| format!("Day {}", period.end_day));
+        let start_date = format_day_of_year(period.start_day);
+        let end_date = format_day_of_year(period.end_day);
 
         println!(
             "{:<4} {:>12} {:>12} {:>12.1} {:>14}",

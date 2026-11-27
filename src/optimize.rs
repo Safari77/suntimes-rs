@@ -844,27 +844,28 @@ fn generate_sun_positions(
     lat: f64,
     lon: f64,
     altitude_m: f64,
-    tz: chrono_tz::Tz,
-    date: chrono::NaiveDate,
+    tz: &jiff::tz::TimeZone,
+    date: jiff::civil::Date,
 ) -> Vec<(f64, f64, f64)> {
     use crate::solar::SolarCalc;
-    use chrono::{Duration, TimeZone};
+    use jiff::SignedDuration;
 
     let solar =
         SolarCalc { lat, lon, alt: altitude_m, delta_t: 69.0, refr: None, target: -1.064699 };
     // Use noon as a stable anchor.
     let noon = tz
-        .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
-        .earliest()
-        .expect("invalid local datetime in test helper");
+        .to_ambiguous_zoned_datetime(date.at(12, 0, 0, 0))
+        .earlier()
+        .expect("invalid local datetime in test helper")
+        .timestamp();
 
     // Step size must match energy integration resolution
     let step_minutes = 10;
-    let step = Duration::minutes(step_minutes);
+    let step = SignedDuration::from_mins(step_minutes);
 
     let mut positions = Vec::new();
-    let start = noon - Duration::hours(12);
-    let end = noon + Duration::hours(12);
+    let start = noon - SignedDuration::from_hours(12);
+    let end = noon + SignedDuration::from_hours(12);
     let mut t = start;
 
     while t <= end {
@@ -874,7 +875,7 @@ fn generate_sun_positions(
         // monotonic and measured in real time, so it is immune to both the
         // hour-of-day midnight wrap and DST clock jumps which would distort
         // the trapezoidal time steps in calculate_daily_energy
-        let hours = (t - start).num_seconds() as f64 / 3600.0;
+        let hours = t.duration_since(start).as_secs() as f64 / 3600.0;
 
         positions.push((hours, pos.elevation_angle(), pos.azimuth()));
 
@@ -888,9 +889,12 @@ fn generate_sun_positions(
 mod tests {
     use super::*;
     use crate::solar_panel::SolarPanelConfig;
-    use chrono::Datelike;
-    use chrono::NaiveDate;
-    use chrono_tz::Europe::Madrid;
+    use jiff::civil::date;
+    use jiff::tz::TimeZone;
+
+    fn madrid_tz() -> TimeZone {
+        TimeZone::get("Europe/Madrid").unwrap()
+    }
 
     #[test]
     fn test_granada_summer_flat_panel_azimuth_regression() {
@@ -900,10 +904,11 @@ mod tests {
         let altitude_m = 619.0;
 
         // June 23, 2025 (matches your CLI example)
-        let date = NaiveDate::from_ymd_opt(2025, 6, 23).unwrap();
-        let day_of_year = date.ordinal();
+        let d = date(2025, 6, 23);
+        let day_of_year = u32::try_from(d.day_of_year()).unwrap();
 
-        let sun_positions = generate_sun_positions(latitude, longitude, altitude_m, Madrid, date);
+        let sun_positions =
+            generate_sun_positions(latitude, longitude, altitude_m, &madrid_tz(), d);
 
         assert!(sun_positions.len() > 20, "Sun position sampling unexpectedly small");
 
@@ -937,19 +942,17 @@ mod tests {
 
     #[test]
     fn test_granada_winter_optimal_steep_and_south() {
-        use chrono::NaiveDate;
-        use chrono_tz::Europe::Madrid;
-
         // Granada, Spain
         let latitude = 37.17;
         let longitude = -3.62;
         let altitude_m = 619.0;
 
         // December 23, 2025 (winter solstice period)
-        let date = NaiveDate::from_ymd_opt(2025, 12, 23).unwrap();
-        let day_of_year = date.ordinal();
+        let d = date(2025, 12, 23);
+        let day_of_year = u32::try_from(d.day_of_year()).unwrap();
 
-        let sun_positions = generate_sun_positions(latitude, longitude, altitude_m, Madrid, date);
+        let sun_positions =
+            generate_sun_positions(latitude, longitude, altitude_m, &madrid_tz(), d);
 
         assert!(sun_positions.len() > 20, "Sun position sampling unexpectedly small");
 
@@ -994,27 +997,24 @@ mod tests {
 
     #[test]
     fn test_granada_annual_average_tilt() {
-        use chrono::NaiveDate;
-        use chrono_tz::Europe::Madrid;
-
+        let madrid = madrid_tz();
         let latitude = 37.17;
         let longitude = -3.62;
         let altitude_m = 619.0;
 
         // Representative days across the year
         let dates = [
-            NaiveDate::from_ymd_opt(2025, 1, 15).unwrap(), // winter
-            NaiveDate::from_ymd_opt(2025, 3, 20).unwrap(), // equinox
-            NaiveDate::from_ymd_opt(2025, 6, 23).unwrap(), // summer
-            NaiveDate::from_ymd_opt(2025, 9, 22).unwrap(), // equinox
-            NaiveDate::from_ymd_opt(2025, 12, 23).unwrap(), // winter
+            date(2025, 1, 15),  // winter
+            date(2025, 3, 20),  // equinox
+            date(2025, 6, 23),  // summer
+            date(2025, 9, 22),  // equinox
+            date(2025, 12, 23), // winter
         ];
 
         let mut tilts = Vec::new();
 
-        for date in dates {
-            let sun_positions =
-                generate_sun_positions(latitude, longitude, altitude_m, Madrid, date);
+        for d in dates {
+            let sun_positions = generate_sun_positions(latitude, longitude, altitude_m, &madrid, d);
 
             let panel_config = SolarPanelConfig {
                 area_m2: 1.0,
@@ -1026,8 +1026,12 @@ mod tests {
                 tracking_mode: crate::solar_panel::TrackingMode::Fixed,
             };
 
-            let optimum =
-                optimize_fixed_panel(panel_config, altitude_m, date.ordinal(), &sun_positions);
+            let optimum = optimize_fixed_panel(
+                panel_config,
+                altitude_m,
+                u32::try_from(d.day_of_year()).unwrap(),
+                &sun_positions,
+            );
 
             tilts.push(optimum.tilt_deg);
         }
@@ -1044,19 +1048,17 @@ mod tests {
 
     #[test]
     fn test_granada_equinox_symmetry() {
-        use chrono::NaiveDate;
-        use chrono_tz::Europe::Madrid;
-
         // Granada, Spain
         let latitude = 37.17;
         let longitude = -3.62;
         let altitude_m = 619.0;
 
         // Spring equinox (approx)
-        let date = NaiveDate::from_ymd_opt(2025, 3, 20).unwrap();
-        let day_of_year = date.ordinal();
+        let d = date(2025, 3, 20);
+        let day_of_year = u32::try_from(d.day_of_year()).unwrap();
 
-        let sun_positions = generate_sun_positions(latitude, longitude, altitude_m, Madrid, date);
+        let sun_positions =
+            generate_sun_positions(latitude, longitude, altitude_m, &madrid_tz(), d);
 
         let panel_config = SolarPanelConfig {
             area_m2: 1.0,
@@ -1096,19 +1098,17 @@ mod tests {
 
     #[test]
     fn test_constrained_tilt_optimization() {
-        use chrono::NaiveDate;
-        use chrono_tz::Europe::Madrid;
-
         // Granada, Spain
         let latitude = 37.17;
         let longitude = -3.62;
         let altitude_m = 619.0;
 
         // Winter solstice - normally would have steep tilt
-        let date = NaiveDate::from_ymd_opt(2025, 12, 23).unwrap();
-        let day_of_year = date.ordinal();
+        let d = date(2025, 12, 23);
+        let day_of_year = u32::try_from(d.day_of_year()).unwrap();
 
-        let sun_positions = generate_sun_positions(latitude, longitude, altitude_m, Madrid, date);
+        let sun_positions =
+            generate_sun_positions(latitude, longitude, altitude_m, &madrid_tz(), d);
 
         let panel_config = SolarPanelConfig {
             area_m2: 1.0,
@@ -1148,18 +1148,16 @@ mod tests {
 
     #[test]
     fn test_constrained_azimuth_optimization() {
-        use chrono::NaiveDate;
-        use chrono_tz::Europe::Madrid;
-
         // Granada, Spain
         let latitude = 37.17;
         let longitude = -3.62;
         let altitude_m = 619.0;
 
-        let date = NaiveDate::from_ymd_opt(2025, 6, 23).unwrap();
-        let day_of_year = date.ordinal();
+        let d = date(2025, 6, 23);
+        let day_of_year = u32::try_from(d.day_of_year()).unwrap();
 
-        let sun_positions = generate_sun_positions(latitude, longitude, altitude_m, Madrid, date);
+        let sun_positions =
+            generate_sun_positions(latitude, longitude, altitude_m, &madrid_tz(), d);
 
         let panel_config = SolarPanelConfig {
             area_m2: 1.0,
@@ -1262,7 +1260,7 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // Synthetic sun-position tests (no chrono / SPA dependency)
+    // Synthetic sun-position tests (no jiff / SPA dependency)
     // ------------------------------------------------------------------
 
     /// Synthetic clear day: the sun rises due east at 06:00, culminates at
